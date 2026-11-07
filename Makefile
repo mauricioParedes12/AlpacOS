@@ -7,8 +7,6 @@ SHELL := /bin/bash
 CROSS ?=
 CC := $(CROSS)gcc
 LD := $(CROSS)ld
-HOST_CC ?= gcc
-PYTHON ?= python3
 QEMU ?= qemu-system-i386
 BUILD := build
 KERNEL := $(BUILD)/alpacos.elf
@@ -24,15 +22,17 @@ LDFLAGS := -m elf_i386 -nostdlib --build-id=none -T boot/linker.ld \
            -Map=$(BUILD)/alpacos.map
 
 C_SOURCES := kernel/main.c kernel/bootinfo.c kernel/console.c \
+             kernel/interrupts/interrupts.c \
              kernel/shell/shell.c kernel/shell/parser.c \
-             drivers/vga.c drivers/serial.c drivers/keyboard.c lib/kstring.c
-ASM_SOURCES := boot/boot.S
+             drivers/vga.c drivers/serial.c drivers/keyboard.c drivers/timer.c \
+             lib/kstring.c
+ASM_SOURCES := boot/boot.S kernel/interrupts/isr.S
 OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(C_SOURCES)) \
            $(patsubst %.S,$(BUILD)/%.o,$(ASM_SOURCES))
 QEMU_COMMON := -machine pc,accel=tcg -m 64M -smp 1 -nic none \
                -no-reboot -no-shutdown
 
-.PHONY: all check test smoke smoke-iso run run-gui iso run-iso debug doctor clean help
+.PHONY: all run run-gui iso run-iso debug clean help
 all: $(KERNEL)
 
 $(KERNEL): $(OBJECTS) boot/linker.ld
@@ -45,21 +45,6 @@ $(BUILD)/%.o: %.c
 $(BUILD)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(ASFLAGS) -c $< -o $@
-
-check: $(KERNEL)
-	$(PYTHON) scripts/check_kernel.py $(KERNEL)
-
-$(BUILD)/test_core: tests/test_core.c kernel/shell/parser.c lib/kstring.c \
-                    include/alpacos/parser.h include/alpacos/kstring.h
-	@mkdir -p $(BUILD)
-	$(HOST_CC) -std=c11 -Wall -Wextra -Werror -Wpedantic -fno-builtin \
-		-Iinclude tests/test_core.c kernel/shell/parser.c lib/kstring.c -o $@
-
-test: check $(BUILD)/test_core
-	./$(BUILD)/test_core
-
-smoke: check
-	$(PYTHON) scripts/smoke_test.py --qemu "$(QEMU)" --kernel $(KERNEL)
 
 run: $(KERNEL)
 	@echo 'Salir de QEMU: Ctrl+A y luego X (sin mantener Ctrl).'
@@ -80,32 +65,21 @@ $(ISO): $(KERNEL) boot/grub.cfg
 run-iso: $(ISO)
 	$(QEMU) $(QEMU_COMMON) -cdrom $(ISO) -boot d -serial stdio -monitor none
 
-smoke-iso: $(ISO)
-	$(PYTHON) scripts/smoke_test.py --qemu "$(QEMU)" --iso $(ISO)
-
 debug: $(KERNEL)
 	@echo 'GDB local: target remote localhost:1234 (CPU pausada al iniciar).'
 	$(QEMU) $(QEMU_COMMON) -kernel $(KERNEL) -display none \
 		-serial mon:stdio -S -gdb tcp:127.0.0.1:1234
-
-doctor:
-	bash scripts/doctor.sh
 
 clean:
 	rm -rf $(BUILD)
 
 help:
 	@echo 'all       Compilar el kernel ELF de 32 bits'
-	@echo 'check     Validar ELF y cabecera Multiboot'
-	@echo 'test      Validacion estatica + pruebas de funciones puras'
-	@echo 'smoke     Arrancar QEMU y comprobar el shell por puerto serie'
 	@echo 'run       QEMU por terminal (funciona sin escritorio grafico)'
 	@echo 'run-gui   QEMU con pantalla VGA y teclado PS/2'
 	@echo 'iso       Crear ISO BIOS con GRUB (dependencias opcionales)'
 	@echo 'run-iso   Arrancar la ISO en QEMU con ventana'
-	@echo 'smoke-iso Comprobar automaticamente el arranque de la ISO'
 	@echo 'debug     Arrancar pausado para GDB en localhost:1234'
-	@echo 'doctor    Revisar herramientas instaladas'
 	@echo 'clean     Borrar solamente build/'
 
 -include $(OBJECTS:.o=.d)

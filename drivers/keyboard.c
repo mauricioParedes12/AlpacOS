@@ -1,4 +1,5 @@
 #include <alpacos/drivers.h>
+#include <alpacos/interrupts.h>
 #include <alpacos/io.h>
 #include <stdbool.h>
 
@@ -26,17 +27,12 @@ static bool left_shift;
 static bool right_shift;
 static bool caps;
 static unsigned skip;
+static char buffer[128];
+static unsigned head;
+static unsigned tail;
 
-int keyboard_read(void)
+static int decode_scancode(uint8_t code)
 {
-    uint8_t status = inb(0x64);
-    if ((status & 1u) == 0u) {
-        return -1;
-    }
-    uint8_t code = inb(0x60);
-    if ((status & 0xE0u) != 0u) {  /* Ignore mouse, parity and timeout bytes. */
-        return -1;
-    }
     if (skip > 0u) {
         --skip;
         return -1;
@@ -72,4 +68,65 @@ int keyboard_read(void)
         c = shifted[code];
     }
     return c == '\0' ? -1 : (unsigned char)c;
+}
+
+static void keyboard_interrupt(void)
+{
+    uint8_t status = inb(0x64);
+    if ((status & 1u) == 0u) return;
+    uint8_t code = inb(0x60);
+    if ((status & 0xE0u) != 0u) return; /* Mouse, paridad o timeout. */
+    int c = decode_scancode(code);
+    if (c < 0) return;
+    unsigned next = (head + 1u) % sizeof(buffer);
+    if (next == tail) return; /* Buffer lleno: descartar sin bloquear la IRQ. */
+    buffer[head] = (char)c;
+    head = next;
+}
+
+static bool controller_ready(void)
+{
+    for (unsigned i = 0; i < 100000u; ++i) {
+        if ((inb(0x64) & 2u) == 0u) return true;
+        cpu_relax();
+    }
+    return false;
+}
+
+bool keyboard_init(void)
+{
+    head = tail = skip = 0;
+    left_shift = right_shift = caps = false;
+    for (unsigned i = 0; i < 256u && (inb(0x64) & 1u) != 0u; ++i) {
+        (void)inb(0x60);
+    }
+    if (!controller_ready()) return false;
+    outb(0x64, 0x20); /* Leer el byte de configuracion del controlador PS/2. */
+    unsigned i;
+    for (i = 0; i < 100000u; ++i) {
+        if ((inb(0x64) & 1u) != 0u) break;
+        cpu_relax();
+    }
+    if (i == 100000u) return false;
+    uint8_t config = inb(0x60);
+    /* IRQ1 y traduccion set 1 activas, reloj habilitado, IRQ12 desactivada. */
+    config = (uint8_t)((config | 0x41u) & (uint8_t)~0x12u);
+    if (!controller_ready()) return false;
+    outb(0x64, 0x60);
+    if (!controller_ready()) return false;
+    outb(0x60, config);
+    irq_register_handler(1, keyboard_interrupt);
+    return true;
+}
+
+int keyboard_read(void)
+{
+    uint32_t flags = interrupts_save();
+    int c = -1;
+    if (tail != head) {
+        c = (unsigned char)buffer[tail];
+        tail = (tail + 1u) % sizeof(buffer);
+    }
+    interrupts_restore(flags);
+    return c;
 }

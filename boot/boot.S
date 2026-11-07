@@ -32,7 +32,7 @@ stack_top:
 .type _start, @function
 .extern kernel_main
 _start:
-    cli                         /* IDT/IRQs are a later milestone. */
+    cli                         /* El kernel instala la IDT antes de usar STI. */
     cld                         /* C memory routines assume forward direction. */
     movl %eax, %esi              /* Multiboot magic, preserved across setup. */
     movl %ebx, %edi              /* Multiboot information pointer. */

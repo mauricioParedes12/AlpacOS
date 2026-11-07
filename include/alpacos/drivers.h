@@ -2,6 +2,7 @@
 #define ALPACOS_DRIVERS_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 void vga_init(void);
 void vga_clear(void);
@@ -10,6 +11,7 @@ void vga_set_color(uint8_t color);
 void serial_init(void);
 void serial_putc(char c);
 int serial_read(void);     /* -1 when no character is available. */
+bool keyboard_init(void);
 int keyboard_read(void);   /* -1 when no printable key is available. */
 
 #endif

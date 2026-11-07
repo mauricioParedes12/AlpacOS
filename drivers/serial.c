@@ -7,7 +7,7 @@ static bool available;
 
 void serial_init(void)
 {
-    outb(COM1 + 1u, 0x00);  /* Disable UART IRQs: polling for this milestone. */
+    outb(COM1 + 1u, 0x00);  /* COM1 sigue por sondeo; no se utiliza IRQ4. */
     outb(COM1 + 3u, 0x80);  /* DLAB, divisor = 1 -> 115200 baud. */
     outb(COM1, 0x01);
     outb(COM1 + 1u, 0x00);

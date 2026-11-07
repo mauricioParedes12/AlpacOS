@@ -1,9 +1,11 @@
 #include <alpacos/bootinfo.h>
 #include <alpacos/console.h>
+#include <alpacos/interrupts.h>
 #include <alpacos/io.h>
 #include <alpacos/kstring.h>
 #include <alpacos/parser.h>
 #include <alpacos/shell.h>
+#include <alpacos/timer.h>
 #include <alpacos/version.h>
 #include <stdbool.h>
 
@@ -18,6 +20,7 @@ static void cmd_help(size_t argc, char **argv);
 static void cmd_clear(size_t argc, char **argv);
 static void cmd_echo(size_t argc, char **argv);
 static void cmd_version(size_t argc, char **argv);
+static void cmd_uptime(size_t argc, char **argv);
 static void cmd_meminfo(size_t argc, char **argv);
 static void cmd_modules(size_t argc, char **argv);
 static void cmd_halt(size_t argc, char **argv);
@@ -27,6 +30,7 @@ static const command_t commands[] = {
     {"clear", "Limpia la consola", cmd_clear},
     {"echo", "Muestra los argumentos separados por espacios", cmd_echo},
     {"version", "Muestra la version y arquitectura", cmd_version},
+    {"uptime", "Muestra los segundos desde el inicio del temporizador", cmd_uptime},
     {"meminfo", "Muestra datos del arranque, no memoria libre", cmd_meminfo},
     {"modules", "Muestra el estado real de los modulos", cmd_modules},
     {"halt", "Detiene la CPU virtual; cierra QEMU para salir", cmd_halt}
@@ -77,6 +81,15 @@ static void cmd_version(size_t argc, char **argv)
     console_writeln("Kernel freestanding en C11 y Assembly (GNU as).");
 }
 
+static void cmd_uptime(size_t argc, char **argv)
+{
+    (void)argv;
+    if (!no_args(argc)) return;
+    console_write("Tiempo encendido: ");
+    console_uint(timer_uptime());
+    console_writeln(" segundos.");
+}
+
 static void cmd_meminfo(size_t argc, char **argv)
 {
     (void)argv;
@@ -107,8 +120,9 @@ static void cmd_modules(size_t argc, char **argv)
     (void)argv;
     if (!no_args(argc)) return;
     console_writeln("[BASE] Boot Multiboot + kernel + GDT + stack");
-    console_writeln("[BASE] Shell y E/S VGA, PS/2 US, COM1 por sondeo");
-    console_writeln("[TODO] IDT, excepciones, IRQ y temporizador");
+    console_writeln("[BASE] Shell, VGA y COM1 por sondeo");
+    console_writeln("[BASE] IDT, excepciones y PIC con IRQ 0..15");
+    console_writeln("[BASE] PIT a unos 100 Hz y teclado PS/2 US por IRQ");
     console_writeln("[TODO] Procesos, PCB y cambio de contexto");
     console_writeln("[TODO] Planificacion de CPU");
     console_writeln("[TODO] Threads y sincronizacion");
@@ -161,12 +175,14 @@ _Noreturn void shell_run(void)
     unsigned escape_state = 0;
     prompt();
     for (;;) {
+        interrupts_disable();
         int input = console_read();
         if (input < 0) {
-            /* Busy polling is temporary: replace after IDT + IRQ are ready. */
-            cpu_relax();
+            /* STI + HLT evita perder una IRQ entre comprobar y dormir. */
+            interrupts_wait();
             continue;
         }
+        interrupts_enable();
         char c = (char)input;
         /* Ignore terminal arrow/function-key escape sequences (no history yet). */
         if (escape_state == 1u) {
