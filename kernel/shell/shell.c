@@ -7,6 +7,7 @@
 #include <alpacos/shell.h>
 #include <alpacos/timer.h>
 #include <alpacos/version.h>
+#include <alpacos/vfs.h>
 #include <stdbool.h>
 
 typedef void (*command_handler_t)(size_t argc, char **argv);
@@ -24,6 +25,13 @@ static void cmd_uptime(size_t argc, char **argv);
 static void cmd_meminfo(size_t argc, char **argv);
 static void cmd_modules(size_t argc, char **argv);
 static void cmd_halt(size_t argc, char **argv);
+static void cmd_ls(size_t argc, char **argv);
+static void cmd_mkdir(size_t argc, char **argv);
+static void cmd_touch(size_t argc, char **argv);
+static void cmd_write(size_t argc, char **argv);
+static void cmd_cat(size_t argc, char **argv);
+static void cmd_rm(size_t argc, char **argv);
+static void cmd_rmdir(size_t argc, char **argv);
 
 static const command_t commands[] = {
     {"help", "Lista los comandos disponibles", cmd_help},
@@ -33,6 +41,13 @@ static const command_t commands[] = {
     {"uptime", "Muestra los segundos desde el inicio del temporizador", cmd_uptime},
     {"meminfo", "Muestra datos del arranque, no memoria libre", cmd_meminfo},
     {"modules", "Muestra el estado real de los modulos", cmd_modules},
+    {"ls", "Lista archivos y directorios: ls [/ruta]", cmd_ls},
+    {"mkdir", "Crea directorio: mkdir /ruta", cmd_mkdir},
+    {"touch", "Crea archivo vacio: touch /ruta", cmd_touch},
+    {"write", "Sobrescribe archivo: write /ruta texto", cmd_write},
+    {"cat", "Lee el archivo: cat /ruta", cmd_cat},
+    {"rm", "Elimina un archivo: rm /ruta", cmd_rm},
+    {"rmdir", "Elimina directorio vacio: rmdir /ruta", cmd_rmdir},
     {"halt", "Detiene la CPU virtual; cierra QEMU para salir", cmd_halt}
 };
 
@@ -127,8 +142,116 @@ static void cmd_modules(size_t argc, char **argv)
     console_writeln("[TODO] Planificacion de CPU");
     console_writeln("[TODO] Threads y sincronizacion");
     console_writeln("[TODO] Memoria y paginacion");
-    console_writeln("[TODO] Sistema de archivos virtual");
+    console_writeln("[OK] VFS en RAM: directorios y archivos (sin persistencia)");
     console_writeln("[TODO] Deteccion/gestion de deadlocks");
+}
+
+static bool require_args(size_t argc, size_t expected, const char *usage)
+{
+    if (argc != expected) {
+        console_write("Uso: ");
+        console_writeln(usage);
+        return false;
+    }
+    return true;
+}
+
+static void fs_result(vfs_result_t result)
+{
+    if (result != VFS_OK) {
+        console_write("Error VFS: ");
+        console_writeln(vfs_result_message(result));
+    }
+}
+
+static void print_entry(const char *name, bool is_directory,
+                        size_t size, void *context)
+{
+    bool *any = context;
+    *any = true;
+    console_write(is_directory ? "  [DIR]  " : "  [FILE] ");
+    console_write(name);
+    if (is_directory) {
+        console_putc('/');
+    } else {
+        console_write(" (");
+        console_uint((uint32_t)size);
+        console_write(" bytes)");
+    }
+    console_putc('\n');
+}
+
+static void cmd_ls(size_t argc, char **argv)
+{
+    if (argc > 2u) {
+        console_writeln("Uso: ls [/ruta]");
+        return;
+    }
+    bool any = false;
+    vfs_result_t result = vfs_list(argc == 2u ? argv[1] : "/",
+                                   print_entry, &any);
+    if (result == VFS_OK && !any) console_writeln("  (directorio vacio)");
+    fs_result(result);
+}
+
+static void cmd_mkdir(size_t argc, char **argv)
+{
+    if (!require_args(argc, 2u, "mkdir /ruta")) return;
+    fs_result(vfs_mkdir(argv[1]));
+}
+
+static void cmd_touch(size_t argc, char **argv)
+{
+    if (!require_args(argc, 2u, "touch /ruta")) return;
+    fs_result(vfs_touch(argv[1]));
+}
+
+static void cmd_write(size_t argc, char **argv)
+{
+    if (argc < 3u) {
+        console_writeln("Uso: write /ruta texto (separado por espacios)");
+        return;
+    }
+    char content[VFS_FILE_CAPACITY];
+    size_t used = 0u;
+    for (size_t i = 2u; i < argc; ++i) {
+        if (i > 2u) content[used++] = ' ';
+        size_t length = kstrlen(argv[i]);
+        if (length >= sizeof(content) - used) {
+            fs_result(VFS_ERR_TOO_LARGE);
+            return;
+        }
+        memcpy(content + used, argv[i], length);
+        used += length;
+    }
+    content[used] = '\0';
+    fs_result(vfs_write(argv[1], content));
+}
+
+static void cmd_cat(size_t argc, char **argv)
+{
+    if (!require_args(argc, 2u, "cat /ruta")) return;
+    const char *content;
+    size_t size;
+    vfs_result_t result = vfs_read(argv[1], &content, &size);
+    if (result == VFS_OK) {
+        (void)size;
+        console_writeln(content);
+    } else {
+        fs_result(result);
+    }
+}
+
+static void cmd_rm(size_t argc, char **argv)
+{
+    if (!require_args(argc, 2u, "rm /ruta")) return;
+    fs_result(vfs_unlink(argv[1]));
+}
+
+static void cmd_rmdir(size_t argc, char **argv)
+{
+    if (!require_args(argc, 2u, "rmdir /ruta")) return;
+    fs_result(vfs_rmdir(argv[1]));
 }
 
 static void cmd_halt(size_t argc, char **argv)
