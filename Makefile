@@ -5,6 +5,7 @@ SHELL := /bin/bash
 # Ubuntu x86_64/WSL2: GCC emits freestanding i386 objects, with no libc.
 # A dedicated cross-toolchain can be used with: make CROSS=i686-elf-
 CROSS ?=
+HOSTCC ?= cc
 CC := $(CROSS)gcc
 LD := $(CROSS)ld
 QEMU ?= qemu-system-i386
@@ -22,7 +23,7 @@ LDFLAGS := -m elf_i386 -nostdlib --build-id=none -T boot/linker.ld \
            -Map=$(BUILD)/alpacos.map
 
 C_SOURCES := kernel/main.c kernel/bootinfo.c kernel/console.c \
-             kernel/interrupts/interrupts.c \
+             kernel/interrupts/interrupts.c kernel/fs/vfs.c \
              kernel/shell/shell.c kernel/shell/parser.c \
              drivers/vga.c drivers/serial.c drivers/keyboard.c drivers/timer.c \
              lib/kstring.c
@@ -32,7 +33,7 @@ OBJECTS := $(patsubst %.c,$(BUILD)/%.o,$(C_SOURCES)) \
 QEMU_COMMON := -machine pc,accel=tcg -m 64M -smp 1 -nic none \
                -no-reboot -no-shutdown
 
-.PHONY: all run run-gui iso run-iso debug clean help
+.PHONY: all run run-gui iso run-iso debug clean help test
 all: $(KERNEL)
 
 $(KERNEL): $(OBJECTS) boot/linker.ld
@@ -70,6 +71,15 @@ debug: $(KERNEL)
 	$(QEMU) $(QEMU_COMMON) -kernel $(KERNEL) -display none \
 		-serial mon:stdio -S -gdb tcp:127.0.0.1:1234
 
+test: $(BUILD)/test_vfs
+	./$(BUILD)/test_vfs
+
+$(BUILD)/test_vfs: tests/test_vfs.c kernel/fs/vfs.c lib/kstring.c \
+                   include/alpacos/vfs.h include/alpacos/kstring.h
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -std=c11 -O2 -fno-builtin -Wall -Wextra -Werror -Wpedantic -Iinclude \
+	    tests/test_vfs.c kernel/fs/vfs.c lib/kstring.c -o $@
+
 clean:
 	rm -rf $(BUILD)
 
@@ -80,6 +90,7 @@ help:
 	@echo 'iso       Crear ISO BIOS con GRUB (dependencias opcionales)'
 	@echo 'run-iso   Arrancar la ISO en QEMU con ventana'
 	@echo 'debug     Arrancar pausado para GDB en localhost:1234'
+	@echo 'test      Ejecutar pruebas unitarias VFS en el anfitrion'
 	@echo 'clean     Borrar solamente build/'
 
 -include $(OBJECTS:.o=.d)
