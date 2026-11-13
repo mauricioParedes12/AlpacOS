@@ -47,7 +47,8 @@ isr_common:
     subl $12, %esp
     pushl %ebx
     call interrupts_dispatch
-    movl %ebx, %esp
+    /* EAX contiene el marco elegido por el planificador (puede ser otra pila). */
+    movl %eax, %esp
 
     popl %eax
     movw %ax, %gs

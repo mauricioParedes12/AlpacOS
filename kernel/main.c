@@ -38,8 +38,8 @@ _Noreturn void kernel_main(uint32_t magic, const multiboot_info_prefix_t *info)
                                   : "[AVISO] Teclado PS/2 no disponible. Usa la terminal serie.");
     console_writeln("[OK] Consola VGA y puerto serie.");
     console_writeln("[OK] Sistema de archivos virtual en RAM (no persistente).");
-    console_writeln("[OK] Procesos, PCB y cambio de contexto cooperativo (manual).");
-    console_writeln("[PENDIENTE] Planificacion automatica y paginacion.");
+    console_writeln("[OK] Procesos y Round Robin: quantum de 10 ticks (~100 ms).");
+    console_writeln("[PENDIENTE] Hilos, sincronizacion, paginacion y deadlocks.");
     console_writeln("Escribe help para ver los comandos.\n");
     interrupts_enable();
     shell_run();

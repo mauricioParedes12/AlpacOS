@@ -35,7 +35,6 @@ static void cmd_rm(size_t argc, char **argv);
 static void cmd_rmdir(size_t argc, char **argv);
 static void cmd_ps(size_t argc, char **argv);
 static void cmd_spawn(size_t argc, char **argv);
-static void cmd_run(size_t argc, char **argv);
 static void cmd_kill(size_t argc, char **argv);
 
 static const command_t commands[] = {
@@ -46,9 +45,8 @@ static const command_t commands[] = {
     {"uptime", "Muestra los segundos desde el inicio del temporizador", cmd_uptime},
     {"meminfo", "Muestra datos del arranque, no memoria libre", cmd_meminfo},
     {"modules", "Muestra el estado real de los modulos", cmd_modules},
-    {"ps", "Lista PID, estado y nombre de los procesos", cmd_ps},
-    {"spawn", "Crea un proceso de demostracion: spawn nombre", cmd_spawn},
-    {"run", "Ejecuta/reanuda hasta ceder la CPU: run PID", cmd_run},
+    {"ps", "Lista procesos, ticks de CPU y turnos recibidos", cmd_ps},
+    {"spawn", "Inicia una tarea de CPU automaticamente: spawn nombre", cmd_spawn},
     {"kill", "Termina un proceso listo: kill PID", cmd_kill},
     {"ls", "Lista archivos y directorios: ls [/ruta]", cmd_ls},
     {"mkdir", "Crea directorio: mkdir /ruta", cmd_mkdir},
@@ -147,8 +145,8 @@ static void cmd_modules(size_t argc, char **argv)
     console_writeln("[BASE] Shell, VGA y COM1 por sondeo");
     console_writeln("[BASE] IDT, excepciones y PIC con IRQ 0..15");
     console_writeln("[BASE] PIT a unos 100 Hz y teclado PS/2 US por IRQ");
-    console_writeln("[OK] Procesos, PCB y contexto cooperativo con run PID");
-    console_writeln("[TODO] Planificacion automatica de CPU (sin quantum)");
+    console_writeln("[OK] Procesos, PCB y contexto completo por interrupciones");
+    console_writeln("[OK] Round Robin preventivo: 10 ticks por turno (~100 ms)");
     console_writeln("[TODO] Threads y sincronizacion");
     console_writeln("[TODO] Memoria y paginacion");
     console_writeln("[OK] VFS en RAM: directorios y archivos (sin persistencia)");
@@ -169,7 +167,10 @@ static void cmd_ps(size_t argc, char **argv)
 {
     (void)argv;
     if (!no_args(argc)) return;
-    console_writeln("PID  ESTADO       NOMBRE");
+    console_write("Round Robin: quantum de ");
+    console_uint(PROCESS_QUANTUM_TICKS);
+    console_writeln(" ticks. El shell tambien recibe turnos.");
+    console_writeln("PID  ESTADO       TICKS  TURNOS  NOMBRE");
     for (size_t i = 0u; i < PROCESS_MAX; ++i) {
         process_info_t info;
         if (!process_get_info(i, &info)) continue;
@@ -181,22 +182,23 @@ static void cmd_ps(size_t argc, char **argv)
             case PROCESS_TERMINATED: console_write("TERMINATED   "); break;
             default: console_write("UNUSED       "); break;
         }
+        console_uint(info.cpu_ticks);
+        console_write("  ");
+        console_uint(info.turns);
+        console_write("  ");
         console_writeln(info.name);
     }
 }
 
 static void demo_process(void)
 {
-    /* Paso local a cada ejecucion: se conserva en su contexto entre dos run. */
-    for (uint32_t step = 1u; step <= 5u; ++step) {
-        console_write("[PID ");
-        console_uint(process_current_pid());
-        console_write("] paso ");
-        console_uint(step);
-        console_writeln("/5");
-        if (step < 5u) process_yield();
+    /* Trabajo sin yield ni HLT: solo IRQ0 puede quitarle la CPU.
+       Dura unos cinco segundos de CPU asignada; ps permite ver su avance.
+       No escribe en segundo plano para no cortar la linea del shell. */
+    uint32_t start = process_cpu_ticks();
+    while ((uint32_t)(process_cpu_ticks() - start) < 5u * TIMER_HZ) {
+        cpu_relax();
     }
-    console_writeln("Proceso terminado.");
 }
 
 static void cmd_spawn(size_t argc, char **argv)
@@ -209,7 +211,7 @@ static void cmd_spawn(size_t argc, char **argv)
     }
     console_write("Proceso creado. PID: ");
     console_uint(pid);
-    console_writeln(" (READY). Usa run PID para ejecutarlo.");
+    console_writeln(". Round Robin lo ejecutara automaticamente; consulta ps.");
 }
 
 static bool parse_pid(const char *text, uint32_t *pid)
@@ -224,15 +226,6 @@ static bool parse_pid(const char *text, uint32_t *pid)
     }
     *pid = value;
     return true;
-}
-
-static void cmd_run(size_t argc, char **argv)
-{
-    if (!require_args(argc, 2u, "run PID")) return;
-    uint32_t pid;
-    if (!parse_pid(argv[1], &pid) || !process_run(pid)) {
-        console_writeln("Error: PID invalido, inexistente, terminado o reservado al shell.");
-    }
 }
 
 static void cmd_kill(size_t argc, char **argv)

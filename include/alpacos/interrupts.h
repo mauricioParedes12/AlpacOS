@@ -3,6 +3,14 @@
 
 #include <stdint.h>
 
+/* Marco completo de isr.S para interrupciones sin cambio de privilegio. */
+typedef struct {
+    uint32_t gs, fs, es, ds;
+    uint32_t edi, esi, ebp, saved_esp, ebx, edx, ecx, eax;
+    uint32_t vector, error;
+    uint32_t eip, cs, eflags;
+} interrupt_frame_t;
+
 typedef void (*irq_handler_t)(void);
 
 void interrupts_init(void);

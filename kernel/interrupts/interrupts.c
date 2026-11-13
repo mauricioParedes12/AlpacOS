@@ -1,6 +1,7 @@
 #include <alpacos/console.h>
 #include <alpacos/interrupts.h>
 #include <alpacos/io.h>
+#include <alpacos/process.h>
 #include <stddef.h>
 
 #define PIC_MASTER_COMMAND 0x20u
@@ -22,16 +23,9 @@ typedef struct {
     uint32_t base;
 } __attribute__((packed)) idt_pointer_t;
 
-/* Debe coincidir con el orden de guardado en interrupts.S. */
-typedef struct {
-    uint32_t gs, fs, es, ds;
-    uint32_t edi, esi, ebp, saved_esp, ebx, edx, ecx, eax;
-    uint32_t vector, error;
-    uint32_t eip, cs, eflags;
-} interrupt_frame_t;
-
 _Static_assert(sizeof(idt_entry_t) == 8, "Tamano de entrada IDT incorrecto");
 _Static_assert(offsetof(interrupt_frame_t, vector) == 48, "Pila de IRQ incorrecta");
+_Static_assert(sizeof(interrupt_frame_t) == 68, "Marco de contexto incorrecto");
 
 extern const uint32_t isr_stub_table[256];
 static idt_entry_t idt[256];
@@ -121,8 +115,9 @@ static _Noreturn void exception_panic(const interrupt_frame_t *frame)
     cpu_halt();
 }
 
-void interrupts_dispatch(const interrupt_frame_t *frame)
+interrupt_frame_t *interrupts_dispatch(interrupt_frame_t *frame)
 {
+    if (frame->vector == 0x80u) return process_schedule(frame, false);
     if (frame->vector < IRQ_BASE || frame->vector >= IRQ_BASE + 16u) {
         exception_panic(frame);
     }
@@ -130,16 +125,18 @@ void interrupts_dispatch(const interrupt_frame_t *frame)
     /* Las IRQ espurias 7 y 15 no deben confirmarse como IRQ reales. */
     if (irq == 7u) {
         outb(PIC_MASTER_COMMAND, 0x0B);
-        if ((inb(PIC_MASTER_COMMAND) & 0x80u) == 0u) return;
+        if ((inb(PIC_MASTER_COMMAND) & 0x80u) == 0u) return frame;
     }
     if (irq == 15u) {
         outb(PIC_SLAVE_COMMAND, 0x0B);
         if ((inb(PIC_SLAVE_COMMAND) & 0x80u) == 0u) {
             outb(PIC_MASTER_COMMAND, 0x20);
-            return;
+            return frame;
         }
     }
     if (irq_handlers[irq] != NULL) irq_handlers[irq]();
     if (irq >= 8u) outb(PIC_SLAVE_COMMAND, 0x20);
     outb(PIC_MASTER_COMMAND, 0x20);
+    /* Confirmar la IRQ antes de entregar la CPU a otro proceso. */
+    return irq == 0u ? process_schedule(frame, true) : frame;
 }

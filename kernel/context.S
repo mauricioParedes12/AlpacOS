@@ -1,28 +1,14 @@
 .section .text
 .code32
-.global context_switch
-.type context_switch, @function
+.global process_yield
+.type process_yield, @function
 
-/* Cambio cooperativo mediante llamada C (ABI i386).
-   EAX, ECX y EDX son temporales segun la ABI; el llamador guarda sus valores
-   vivos. Todos los procesos usan los mismos segmentos y memoria del kernel.
-   No usar esta rutina directamente como cambio preventivo desde una IRQ. */
-context_switch:
-    pushfl
-    pushl %ebp
-    pushl %ebx
-    pushl %esi
-    pushl %edi
-    movl 24(%esp), %eax /* &old_stack */
-    movl 28(%esp), %edx /* new_stack */
-    movl %esp, (%eax)
-    movl %edx, %esp
-    popl %edi
-    popl %esi
-    popl %ebx
-    popl %ebp
-    popfl
+/* Ceder el resto del turno usa la misma ruta que la preempcion.
+   isr.S guarda todos los registros y retorna al contexto elegido con IRET.
+   El vector 0x80 solo acepta llamadas desde ring 0; no es una API de usuario. */
+process_yield:
+    int $0x80
     ret
-.size context_switch, . - context_switch
+.size process_yield, . - process_yield
 
 .section .note.GNU-stack, "", @progbits
