@@ -3,6 +3,7 @@
 #include <alpacos/drivers.h>
 #include <alpacos/interrupts.h>
 #include <alpacos/io.h>
+#include <alpacos/process.h>
 #include <alpacos/shell.h>
 #include <alpacos/timer.h>
 #include <alpacos/version.h>
@@ -29,6 +30,7 @@ _Noreturn void kernel_main(uint32_t magic, const multiboot_info_prefix_t *info)
     timer_init();
     bool keyboard_ready = keyboard_init();
     vfs_init();
+    process_init();
     console_writeln("[OK] Multiboot, GDT, stack y kernel C inicializados.");
     console_writeln("[OK] IDT, excepciones y controlador PIC inicializados.");
     console_writeln("[OK] Temporizador PIT a unos 100 Hz (IRQ0).");
@@ -36,7 +38,8 @@ _Noreturn void kernel_main(uint32_t magic, const multiboot_info_prefix_t *info)
                                   : "[AVISO] Teclado PS/2 no disponible. Usa la terminal serie.");
     console_writeln("[OK] Consola VGA y puerto serie.");
     console_writeln("[OK] Sistema de archivos virtual en RAM (no persistente).");
-    console_writeln("[PENDIENTE] Multitarea y paginacion.");
+    console_writeln("[OK] Procesos, PCB y cambio de contexto cooperativo (manual).");
+    console_writeln("[PENDIENTE] Planificacion automatica y paginacion.");
     console_writeln("Escribe help para ver los comandos.\n");
     interrupts_enable();
     shell_run();
