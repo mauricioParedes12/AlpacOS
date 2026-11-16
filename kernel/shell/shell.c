@@ -6,6 +6,7 @@
 #include <alpacos/parser.h>
 #include <alpacos/process.h>
 #include <alpacos/shell.h>
+#include <alpacos/sync.h>
 #include <alpacos/timer.h>
 #include <alpacos/version.h>
 #include <alpacos/vfs.h>
@@ -34,7 +35,9 @@ static void cmd_cat(size_t argc, char **argv);
 static void cmd_rm(size_t argc, char **argv);
 static void cmd_rmdir(size_t argc, char **argv);
 static void cmd_ps(size_t argc, char **argv);
+static void cmd_threads(size_t argc, char **argv);
 static void cmd_spawn(size_t argc, char **argv);
+static void cmd_thread(size_t argc, char **argv);
 static void cmd_kill(size_t argc, char **argv);
 
 static const command_t commands[] = {
@@ -45,9 +48,11 @@ static const command_t commands[] = {
     {"uptime", "Muestra los segundos desde el inicio del temporizador", cmd_uptime},
     {"meminfo", "Muestra datos del arranque, no memoria libre", cmd_meminfo},
     {"modules", "Muestra el estado real de los modulos", cmd_modules},
-    {"ps", "Lista procesos, ticks de CPU y turnos recibidos", cmd_ps},
-    {"spawn", "Inicia una tarea de CPU automaticamente: spawn nombre", cmd_spawn},
-    {"kill", "Termina un proceso listo: kill PID", cmd_kill},
+    {"ps", "Lista procesos y cantidad de hilos", cmd_ps},
+    {"threads", "Lista hilos, estados, turnos y contador compartido", cmd_threads},
+    {"spawn", "Crea un proceso con su primer hilo: spawn nombre", cmd_spawn},
+    {"thread", "Agrega un hilo a un proceso: thread PID nombre", cmd_thread},
+    {"kill", "Termina un proceso que no tenga hilos bloqueados", cmd_kill},
     {"ls", "Lista archivos y directorios: ls [/ruta]", cmd_ls},
     {"mkdir", "Crea directorio: mkdir /ruta", cmd_mkdir},
     {"touch", "Crea archivo vacio: touch /ruta", cmd_touch},
@@ -147,7 +152,8 @@ static void cmd_modules(size_t argc, char **argv)
     console_writeln("[BASE] PIT a unos 100 Hz y teclado PS/2 US por IRQ");
     console_writeln("[OK] Procesos, PCB y contexto completo por interrupciones");
     console_writeln("[OK] Round Robin preventivo: 10 ticks por turno (~100 ms)");
-    console_writeln("[TODO] Threads y sincronizacion");
+    console_writeln("[OK] Hilos del kernel y Round Robin por TID");
+    console_writeln("[OK] Mutex con bloqueo y despertar de hilos");
     console_writeln("[TODO] Memoria y paginacion");
     console_writeln("[OK] VFS en RAM: directorios y archivos (sin persistencia)");
     console_writeln("[TODO] Deteccion/gestion de deadlocks");
@@ -163,14 +169,77 @@ static bool require_args(size_t argc, size_t expected, const char *usage)
     return true;
 }
 
+typedef struct {
+    uint32_t pid;
+    volatile uint32_t counter;
+    mutex_t mutex;
+} demo_context_t;
+
+static demo_context_t demo_contexts[PROCESS_MAX - 1u];
+#define DEMO_ITERATIONS 200u
+
+static demo_context_t *demo_context_for_pid(uint32_t pid)
+{
+    for (size_t i = 0u; i < PROCESS_MAX - 1u; ++i) {
+        if (demo_contexts[i].pid == pid) return &demo_contexts[i];
+    }
+    return NULL;
+}
+
+static demo_context_t *demo_context_available(void)
+{
+    for (size_t i = 0u; i < PROCESS_MAX - 1u; ++i) {
+        if (demo_contexts[i].pid == 0u) return &demo_contexts[i];
+        bool active = false;
+        for (size_t slot = 1u; slot < PROCESS_MAX; ++slot) {
+            process_info_t info;
+            if (process_get_info(slot, &info) &&
+                info.pid == demo_contexts[i].pid &&
+                info.state != PROCESS_TERMINATED) {
+                active = true;
+                break;
+            }
+        }
+        if (!active) {
+            demo_contexts[i].pid = 0u;
+            return &demo_contexts[i];
+        }
+    }
+    return NULL;
+}
+
+static void demo_thread(void)
+{
+    demo_context_t *context = demo_context_for_pid(process_current_pid());
+    if (context == NULL) return;
+
+    bool yielded_while_locked = false;
+    for (uint32_t i = 0u; i < DEMO_ITERATIONS; ++i) {
+        if (!mutex_lock(&context->mutex)) return;
+        /* Fuerza una espera real en otro hilo durante la primera seccion critica. */
+        if (!yielded_while_locked) {
+            yielded_while_locked = true;
+            process_yield();
+        }
+        ++context->counter;
+        if (!mutex_unlock(&context->mutex)) return;
+    }
+
+    /* Deja tiempo para agregar hilos desde el shell antes de finalizar el proceso. */
+    uint32_t start = process_cpu_ticks();
+    while ((uint32_t)(process_cpu_ticks() - start) < 5u * TIMER_HZ) {
+        cpu_relax();
+    }
+}
+
 static void cmd_ps(size_t argc, char **argv)
 {
     (void)argv;
     if (!no_args(argc)) return;
-    console_write("Round Robin: quantum de ");
+    console_write("Round Robin por hilos: quantum de ");
     console_uint(PROCESS_QUANTUM_TICKS);
-    console_writeln(" ticks. El shell tambien recibe turnos.");
-    console_writeln("PID  ESTADO       TICKS  TURNOS  NOMBRE");
+    console_writeln(" ticks. El shell tambien participa.");
+    console_writeln("PID  ESTADO       HILOS  TICKS  TURNOS  NOMBRE");
     for (size_t i = 0u; i < PROCESS_MAX; ++i) {
         process_info_t info;
         if (!process_get_info(i, &info)) continue;
@@ -179,9 +248,12 @@ static void cmd_ps(size_t argc, char **argv)
         switch (info.state) {
             case PROCESS_READY: console_write("READY        "); break;
             case PROCESS_RUNNING: console_write("RUNNING      "); break;
+            case PROCESS_BLOCKED: console_write("BLOCKED      "); break;
             case PROCESS_TERMINATED: console_write("TERMINATED   "); break;
             default: console_write("UNUSED       "); break;
         }
+        console_uint(info.thread_count);
+        console_write("      ");
         console_uint(info.cpu_ticks);
         console_write("  ");
         console_uint(info.turns);
@@ -190,28 +262,66 @@ static void cmd_ps(size_t argc, char **argv)
     }
 }
 
-static void demo_process(void)
+static void cmd_threads(size_t argc, char **argv)
 {
-    /* Trabajo sin yield ni HLT: solo IRQ0 puede quitarle la CPU.
-       Dura unos cinco segundos de CPU asignada; ps permite ver su avance.
-       No escribe en segundo plano para no cortar la linea del shell. */
-    uint32_t start = process_cpu_ticks();
-    while ((uint32_t)(process_cpu_ticks() - start) < 5u * TIMER_HZ) {
-        cpu_relax();
+    (void)argv;
+    if (!no_args(argc)) return;
+    console_writeln("TID  PID  ESTADO       TICKS  TURNOS  NOMBRE");
+    for (size_t i = 0u; i < THREAD_MAX; ++i) {
+        thread_info_t info;
+        if (!thread_get_info(i, &info)) continue;
+        console_uint(info.tid);
+        console_write("  ");
+        console_uint(info.pid);
+        console_write("  ");
+        switch (info.state) {
+            case THREAD_READY: console_write("READY        "); break;
+            case THREAD_RUNNING: console_write("RUNNING      "); break;
+            case THREAD_BLOCKED: console_write("BLOCKED      "); break;
+            case THREAD_TERMINATED: console_write("TERMINATED   "); break;
+            default: console_write("UNUSED       "); break;
+        }
+        console_uint(info.cpu_ticks);
+        console_write("  ");
+        console_uint(info.turns);
+        console_write("  ");
+        console_writeln(info.name);
+    }
+    console_writeln("Contadores compartidos por proceso:");
+    for (size_t i = 0u; i < PROCESS_MAX - 1u; ++i) {
+        if (demo_contexts[i].pid == 0u) continue;
+        console_write("  PID ");
+        console_uint(demo_contexts[i].pid);
+        console_write(": ");
+        console_uint(demo_contexts[i].counter);
+        console_putc('\n');
     }
 }
 
 static void cmd_spawn(size_t argc, char **argv)
 {
     if (!require_args(argc, 2u, "spawn nombre")) return;
-    uint32_t pid = process_spawn(argv[1], demo_process);
+    demo_context_t *context = demo_context_available();
+    if (context == NULL) {
+        console_writeln("Error: no hay espacio para otro proceso de prueba.");
+        return;
+    }
+
+    uint32_t flags = interrupts_save();
+    uint32_t pid = process_spawn(argv[1], demo_thread);
+    if (pid != 0u) {
+        context->pid = pid;
+        context->counter = 0u;
+        mutex_init(&context->mutex);
+    }
+    interrupts_restore(flags);
     if (pid == 0u) {
-        console_writeln("Error: nombre de 1 a 23 caracteres y maximo 7 procesos activos.");
+        console_writeln("Error: nombre invalido o limite de procesos/hilos alcanzado.");
         return;
     }
     console_write("Proceso creado. PID: ");
     console_uint(pid);
-    console_writeln(". Round Robin lo ejecutara automaticamente; consulta ps.");
+    console_writeln(". Tiene un hilo inicial; usa thread para agregar mas.");
 }
 
 static bool parse_pid(const char *text, uint32_t *pid)
@@ -228,12 +338,32 @@ static bool parse_pid(const char *text, uint32_t *pid)
     return true;
 }
 
+static void cmd_thread(size_t argc, char **argv)
+{
+    if (!require_args(argc, 3u, "thread PID nombre")) return;
+    uint32_t pid;
+    if (!parse_pid(argv[1], &pid) || demo_context_for_pid(pid) == NULL) {
+        console_writeln("Error: PID invalido o sin contexto de prueba activo.");
+        return;
+    }
+    uint32_t tid = thread_spawn(pid, argv[2], demo_thread);
+    if (tid == 0u) {
+        console_writeln("Error: proceso inexistente o limite de hilos alcanzado.");
+        return;
+    }
+    console_write("Hilo creado. TID: ");
+    console_uint(tid);
+    console_write(" (PID ");
+    console_uint(pid);
+    console_writeln(").");
+}
+
 static void cmd_kill(size_t argc, char **argv)
 {
     if (!require_args(argc, 2u, "kill PID")) return;
     uint32_t pid;
     if (!parse_pid(argv[1], &pid) || !process_kill(pid)) {
-        console_writeln("Error: solo se puede terminar un proceso READY distinto del shell.");
+        console_writeln("Error: proceso inexistente, en ejecucion o con hilos bloqueados.");
         return;
     }
     console_writeln("Proceso terminado.");
