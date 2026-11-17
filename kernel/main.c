@@ -2,6 +2,7 @@
 #include <alpacos/console.h>
 #include <alpacos/drivers.h>
 #include <alpacos/interrupts.h>
+#include <alpacos/memory.h>
 #include <alpacos/io.h>
 #include <alpacos/process.h>
 #include <alpacos/shell.h>
@@ -26,6 +27,13 @@ _Noreturn void kernel_main(uint32_t magic, const multiboot_info_prefix_t *info)
         console_writeln("PANIC: se requiere un cargador Multiboot v1.");
         cpu_halt();
     }
+    const boot_info_t *boot = bootinfo_get();
+    if (!boot->memory_available ||
+        !memory_init(boot->lower_kib, boot->upper_kib, boot->kernel_end)) {
+        console_set_color(0x0C);
+        console_writeln("PANIC: no se pudo inicializar el gestor de memoria/paginacion.");
+        cpu_halt();
+    }
     interrupts_init();
     timer_init();
     bool keyboard_ready = keyboard_init();
@@ -40,7 +48,8 @@ _Noreturn void kernel_main(uint32_t magic, const multiboot_info_prefix_t *info)
     console_writeln("[OK] Sistema de archivos virtual en RAM (no persistente).");
     console_writeln("[OK] Procesos y Round Robin por hilos: quantum de 10 ticks (~100 ms).");
     console_writeln("[OK] Hilos del kernel y mutex con bloqueo/despertar.");
-    console_writeln("[PENDIENTE] Memoria, paginacion y deadlocks.");
+    console_writeln("[OK] Marcos fisicos de 4 KiB y paginacion x86 activa (64 MiB identidad).");
+    console_writeln("[PENDIENTE] Espacios virtuales independientes y deadlocks.");
     console_writeln("Escribe help para ver los comandos.\n");
     interrupts_enable();
     shell_run();
