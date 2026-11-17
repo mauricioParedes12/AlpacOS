@@ -3,6 +3,7 @@
 #include <alpacos/interrupts.h>
 #include <alpacos/io.h>
 #include <alpacos/kstring.h>
+#include <alpacos/memory.h>
 #include <alpacos/parser.h>
 #include <alpacos/process.h>
 #include <alpacos/shell.h>
@@ -25,6 +26,8 @@ static void cmd_echo(size_t argc, char **argv);
 static void cmd_version(size_t argc, char **argv);
 static void cmd_uptime(size_t argc, char **argv);
 static void cmd_meminfo(size_t argc, char **argv);
+static void cmd_pagealloc(size_t argc, char **argv);
+static void cmd_pagefree(size_t argc, char **argv);
 static void cmd_modules(size_t argc, char **argv);
 static void cmd_halt(size_t argc, char **argv);
 static void cmd_ls(size_t argc, char **argv);
@@ -39,6 +42,7 @@ static void cmd_threads(size_t argc, char **argv);
 static void cmd_spawn(size_t argc, char **argv);
 static void cmd_thread(size_t argc, char **argv);
 static void cmd_kill(size_t argc, char **argv);
+static bool require_args(size_t argc, size_t expected, const char *usage);
 
 static const command_t commands[] = {
     {"help", "Lista los comandos disponibles", cmd_help},
@@ -46,13 +50,15 @@ static const command_t commands[] = {
     {"echo", "Muestra los argumentos separados por espacios", cmd_echo},
     {"version", "Muestra la version y arquitectura", cmd_version},
     {"uptime", "Muestra los segundos desde el inicio del temporizador", cmd_uptime},
-    {"meminfo", "Muestra datos del arranque, no memoria libre", cmd_meminfo},
+    {"meminfo", "Muestra RAM, marcos libres y estado de paginacion", cmd_meminfo},
+    {"pagealloc", "Reserva y mapea una pagina virtual de prueba", cmd_pagealloc},
+    {"pagefree", "Desmapea y libera una pagina: pagefree 0xD0000000", cmd_pagefree},
     {"modules", "Muestra el estado real de los modulos", cmd_modules},
     {"ps", "Lista procesos y cantidad de hilos", cmd_ps},
     {"threads", "Lista hilos, estados, turnos y contador compartido", cmd_threads},
     {"spawn", "Crea un proceso con su primer hilo: spawn nombre", cmd_spawn},
     {"thread", "Agrega un hilo a un proceso: thread PID nombre", cmd_thread},
-    {"kill", "Termina un proceso que no tenga hilos bloqueados", cmd_kill},
+    {"kill", "Solicita la finalizacion ordenada de un proceso", cmd_kill},
     {"ls", "Lista archivos y directorios: ls [/ruta]", cmd_ls},
     {"mkdir", "Crea directorio: mkdir /ruta", cmd_mkdir},
     {"touch", "Crea archivo vacio: touch /ruta", cmd_touch},
@@ -122,24 +128,119 @@ static void cmd_meminfo(size_t argc, char **argv)
     (void)argv;
     if (!no_args(argc)) return;
     const boot_info_t *info = bootinfo_get();
+    memory_stats_t stats;
+    memory_get_stats(&stats);
     if (info->memory_available) {
-        console_write("Memoria convencional reportada: ");
-        console_uint(info->lower_kib);
-        console_writeln(" KiB");
-        console_write("Memoria superior contigua reportada (desde 1 MiB): ");
-        console_uint(info->upper_kib);
+        console_write("Memoria reportada por Multiboot: ");
+        console_uint(info->lower_kib + info->upper_kib);
         console_writeln(" KiB");
     } else {
         console_writeln("El cargador no proporciono memoria basica.");
     }
+    console_write("Marcos de 4 KiB: total=");
+    console_uint(stats.total_frames);
+    console_write(" usados=");
+    console_uint(stats.used_frames);
+    console_write(" libres=");
+    console_uint(stats.free_frames);
+    console_putc('\n');
+    console_write("Reservados para memoria baja/kernel: ");
+    console_uint(stats.reserved_frames);
+    console_writeln(" marcos");
+    console_write("Paginacion: ");
+    console_writeln(stats.paging_enabled ? "ACTIVA (mapeo identidad de 64 MiB)" : "INACTIVA");
     console_write("Kernel: ");
     console_hex((uint32_t)info->kernel_start);
     console_write(" - ");
     console_hex((uint32_t)info->kernel_end);
     console_write(" (fin exclusivo, ");
     console_uint((uint32_t)(info->kernel_end - info->kernel_start));
-    console_writeln(" bytes reservados, incluida la pila)");
-    console_writeln("Datos de arranque. Sin allocator ni paginacion todavia.");
+    console_writeln(" bytes, incluida la pila)");
+}
+
+static bool parse_address(const char *text, uintptr_t *address)
+{
+    uint32_t base = 10u;
+    uint32_t value = 0u;
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        text += 2;
+        base = 16u;
+    }
+    if (*text == '\0') return false;
+    for (; *text != '\0'; ++text) {
+        uint32_t digit;
+        if (*text >= '0' && *text <= '9') digit = (uint32_t)(*text - '0');
+        else if (base == 16u && *text >= 'a' && *text <= 'f') digit = (uint32_t)(*text - 'a') + 10u;
+        else if (base == 16u && *text >= 'A' && *text <= 'F') digit = (uint32_t)(*text - 'A') + 10u;
+        else return false;
+        if (digit >= base || value > (UINT32_MAX - digit) / base) return false;
+        value = value * base + digit;
+    }
+    *address = (uintptr_t)value;
+    return true;
+}
+
+static bool page_test_slots[MEMORY_TEST_PAGE_COUNT];
+
+static void cmd_pagealloc(size_t argc, char **argv)
+{
+    (void)argv;
+    if (!no_args(argc)) return;
+    size_t slot;
+    for (slot = 0u; slot < MEMORY_TEST_PAGE_COUNT; ++slot) {
+        if (!page_test_slots[slot]) break;
+    }
+    if (slot == MEMORY_TEST_PAGE_COUNT) {
+        console_writeln("Error: se alcanzo el limite de paginas de prueba.");
+        return;
+    }
+
+    uintptr_t virtual_address = MEMORY_TEST_VIRTUAL_BASE + slot * MEMORY_PAGE_SIZE;
+    uintptr_t physical_address;
+    if (!memory_page_alloc(virtual_address, &physical_address)) {
+        console_writeln("Error: no se pudo reservar o mapear el marco fisico.");
+        return;
+    }
+    volatile uint32_t *probe = (volatile uint32_t *)virtual_address;
+    *probe = 0xA1FA0C05u;
+    if (*probe != 0xA1FA0C05u) {
+        (void)memory_page_free(virtual_address, NULL);
+        console_writeln("Error: la prueba de lectura/escritura de la pagina fallo.");
+        return;
+    }
+    page_test_slots[slot] = true;
+    console_write("Pagina virtual: ");
+    console_hex((uint32_t)virtual_address);
+    console_write(" -> marco fisico: ");
+    console_hex((uint32_t)physical_address);
+    console_writeln(". Lectura/escritura correcta.");
+}
+
+static void cmd_pagefree(size_t argc, char **argv)
+{
+    if (!require_args(argc, 2u, "pagefree 0xD0000000")) return;
+    uintptr_t virtual_address;
+    if (!parse_address(argv[1], &virtual_address) ||
+        virtual_address < MEMORY_TEST_VIRTUAL_BASE ||
+        virtual_address >= MEMORY_TEST_VIRTUAL_BASE + MEMORY_TEST_PAGE_COUNT * MEMORY_PAGE_SIZE ||
+        (virtual_address & (MEMORY_PAGE_SIZE - 1u)) != 0u) {
+        console_writeln("Error: direccion invalida; usa una direccion mostrada por pagealloc.");
+        return;
+    }
+    size_t slot = (virtual_address - MEMORY_TEST_VIRTUAL_BASE) / MEMORY_PAGE_SIZE;
+    if (!page_test_slots[slot]) {
+        console_writeln("Error: esa pagina no esta reservada.");
+        return;
+    }
+    uintptr_t physical_address;
+    if (!memory_page_free(virtual_address, &physical_address)) {
+        console_writeln("Error: no se pudo desmapear o liberar el marco.");
+        return;
+    }
+    page_test_slots[slot] = false;
+    console_write("Pagina liberada. Marco fisico: ");
+    console_hex((uint32_t)physical_address);
+    console_putc('\n');
 }
 
 static void cmd_modules(size_t argc, char **argv)
@@ -154,7 +255,8 @@ static void cmd_modules(size_t argc, char **argv)
     console_writeln("[OK] Round Robin preventivo: 10 ticks por turno (~100 ms)");
     console_writeln("[OK] Hilos del kernel y Round Robin por TID");
     console_writeln("[OK] Mutex con bloqueo y despertar de hilos");
-    console_writeln("[TODO] Memoria y paginacion");
+    console_writeln("[OK] Allocator de marcos de 4 KiB y paginacion x86 activa");
+    console_writeln("[OK] Mapeo identidad de 64 MiB y paginas virtuales de prueba");
     console_writeln("[OK] VFS en RAM: directorios y archivos (sin persistencia)");
     console_writeln("[TODO] Deteccion/gestion de deadlocks");
 }
@@ -172,11 +274,11 @@ static bool require_args(size_t argc, size_t expected, const char *usage)
 typedef struct {
     uint32_t pid;
     volatile uint32_t counter;
+    volatile bool stop_requested;
     mutex_t mutex;
 } demo_context_t;
 
 static demo_context_t demo_contexts[PROCESS_MAX - 1u];
-#define DEMO_ITERATIONS 200u
 
 static demo_context_t *demo_context_for_pid(uint32_t pid)
 {
@@ -213,22 +315,19 @@ static void demo_thread(void)
     demo_context_t *context = demo_context_for_pid(process_current_pid());
     if (context == NULL) return;
 
-    bool yielded_while_locked = false;
-    for (uint32_t i = 0u; i < DEMO_ITERATIONS; ++i) {
+    for (;;) {
         if (!mutex_lock(&context->mutex)) return;
-        /* Fuerza una espera real en otro hilo durante la primera seccion critica. */
-        if (!yielded_while_locked) {
-            yielded_while_locked = true;
-            process_yield();
+        if (context->stop_requested) {
+            (void)mutex_unlock(&context->mutex);
+            return;
         }
-        ++context->counter;
-        if (!mutex_unlock(&context->mutex)) return;
-    }
 
-    /* Deja tiempo para agregar hilos desde el shell antes de finalizar el proceso. */
-    uint32_t start = process_cpu_ticks();
-    while ((uint32_t)(process_cpu_ticks() - start) < 5u * TIMER_HZ) {
-        cpu_relax();
+        ++context->counter;
+        /* Cede la CPU con el mutex tomado para que otro hilo tenga que esperar. */
+        process_yield();
+        bool stop = context->stop_requested;
+        if (!mutex_unlock(&context->mutex)) return;
+        if (stop) return;
     }
 }
 
@@ -312,6 +411,7 @@ static void cmd_spawn(size_t argc, char **argv)
     if (pid != 0u) {
         context->pid = pid;
         context->counter = 0u;
+        context->stop_requested = false;
         mutex_init(&context->mutex);
     }
     interrupts_restore(flags);
@@ -342,8 +442,13 @@ static void cmd_thread(size_t argc, char **argv)
 {
     if (!require_args(argc, 3u, "thread PID nombre")) return;
     uint32_t pid;
-    if (!parse_pid(argv[1], &pid) || demo_context_for_pid(pid) == NULL) {
-        console_writeln("Error: PID invalido o sin contexto de prueba activo.");
+    if (!parse_pid(argv[1], &pid)) {
+        console_writeln("Error: PID invalido.");
+        return;
+    }
+    demo_context_t *context = demo_context_for_pid(pid);
+    if (context == NULL || context->stop_requested) {
+        console_writeln("Error: el proceso no existe o ya esta finalizando.");
         return;
     }
     uint32_t tid = thread_spawn(pid, argv[2], demo_thread);
@@ -362,8 +467,31 @@ static void cmd_kill(size_t argc, char **argv)
 {
     if (!require_args(argc, 2u, "kill PID")) return;
     uint32_t pid;
-    if (!parse_pid(argv[1], &pid) || !process_kill(pid)) {
-        console_writeln("Error: proceso inexistente, en ejecucion o con hilos bloqueados.");
+    if (!parse_pid(argv[1], &pid)) {
+        console_writeln("Error: PID invalido.");
+        return;
+    }
+
+    demo_context_t *context = demo_context_for_pid(pid);
+    if (context != NULL) {
+        bool active = false;
+        for (size_t i = 1u; i < PROCESS_MAX; ++i) {
+            process_info_t info;
+            if (process_get_info(i, &info) && info.pid == pid &&
+                info.state != PROCESS_TERMINATED && info.state != PROCESS_UNUSED) {
+                active = true;
+                break;
+            }
+        }
+        if (active) {
+            context->stop_requested = true;
+            console_writeln("Solicitud enviada; los hilos terminaran al liberar el mutex.");
+            return;
+        }
+    }
+
+    if (!process_kill(pid)) {
+        console_writeln("Error: proceso inexistente o con hilos bloqueados.");
         return;
     }
     console_writeln("Proceso terminado.");
