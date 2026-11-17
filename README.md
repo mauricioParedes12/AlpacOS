@@ -4,7 +4,7 @@ AlpacOS es el mini sistema operativo que estamos desarrollando para el curso de 
 
 Está escrito en C11 y Assembly (GNU as), para x86 de 32 bits. Lo ejecutamos en QEMU y se puede compilar desde Linux o desde Windows con Ubuntu en WSL2.
 
-## Avance actual: v0.7.0
+## Avance actual: v0.8.0
 
 El sistema ya arranca con Multiboot y tiene una consola con comandos propios. Cuenta con salida VGA y por puerto serie, teclado PS/2 por interrupciones, un temporizador PIT y un sistema de archivos en RAM. El arranque configura la GDT y la pila; el kernel instala la IDT y el PIC para atender excepciones e interrupciones.
 
@@ -14,7 +14,7 @@ También incorporamos mutex. Cuando un hilo intenta tomar uno que ya está ocupa
 
 En esta versión agregamos un gestor sencillo de marcos físicos de 4 KiB y activamos la paginación de x86. El kernel mantiene un mapeo identidad de los primeros 64 MiB y puede reservar marcos, mapearlos en direcciones virtuales de prueba y liberarlos. `meminfo` muestra ahora los marcos totales, usados y libres; `pagealloc` y `pagefree` permiten comprobar la reserva y liberación desde el shell.
 
-El mapa de memoria es compartido por todo el kernel. Los procesos e hilos todavía no tienen directorios de páginas propios ni aislamiento entre sí. Tampoco hay memoria virtual bajo demanda, swapping ni detección de deadlocks.
+El mapa de memoria es compartido por todo el kernel. Los procesos e hilos todavía no tienen directorios de páginas propios ni aislamiento entre sí. Tampoco hay memoria virtual bajo demanda ni swapping. La detección de deadlocks se agregó en la v0.8.0.
 
 ## Compilar y ejecutar
 
@@ -117,7 +117,7 @@ Cada hilo tiene su propio TCB, TID, estado, contexto y pila de 8 KiB. El límite
 
 El planificador usa una cola FIFO de hilos. El quantum sigue siendo de 10 ticks del PIT, aproximadamente 100 ms. Cuando termina el turno, el hilo que estaba ejecutándose vuelve al final de la cola y el siguiente recibe la CPU. El cambio de contexto guarda y restaura los registros desde la interrupción del temporizador.
 
-El módulo de sincronización incluye un mutex no recursivo. Si un hilo intenta bloquear un mutex que pertenece a otro, se agrega a la cola de espera y pasa a `BLOCKED`. Cuando el propietario lo libera, la propiedad se transfiere al siguiente hilo y este vuelve a `READY`. Si un hilo intenta bloquear dos veces el mismo mutex, la operación falla en vez de dejarlo esperando por sí mismo. La detección de deadlocks todavía no está implementada.
+El módulo de sincronización incluye un mutex no recursivo. Si un hilo intenta bloquear un mutex que pertenece a otro, se agrega a la cola de espera y pasa a `BLOCKED`. Cuando el propietario lo libera, la propiedad se transfiere al siguiente hilo y este vuelve a `READY`. Si un hilo intenta bloquear dos veces el mismo mutex, la operación falla en vez de dejarlo esperando por sí mismo. La detección de ciclos de espera se agregó en la v0.8.0.
 
 ### Probar procesos, hilos y mutex
 
@@ -150,6 +150,27 @@ Revisan la creación de archivos y directorios, lectura, escritura, eliminación
 Para revisar la planificación y los mutex, usa el ejemplo de la sección anterior dentro de QEMU. Comprueba que los tres hilos queden asociados al mismo PID, que cada uno tenga un TID distinto y que el contador compartido aumente. Con varios hilos activos, `threads` debe permitir observar hilos en `BLOCKED` mientras esperan el mutex. Para cerrar la prueba, ejecuta `kill` con el PID del proceso y vuelve a consultar `ps` y `threads`. Para la memoria, ejecuta el ejemplo de `meminfo`, `pagealloc` y `pagefree` de la sección anterior; el número de marcos libres debe bajar al reservar la página y recuperarse al liberarla (la tabla de páginas vacía también se devuelve al allocator).
 
 `make test` solo comprueba el VFS; las pruebas de procesos, hilos, sincronización y paginación se hacen al arrancar el kernel en QEMU. El shell y los comandos de archivos deben seguir funcionando mientras los hilos reciben sus turnos.
+
+## Deadlocks (v0.8.0)
+
+La detección usa el estado real de los mutex: registra qué hilo espera cada recurso y quién lo posee. Como cada mutex tiene un propietario, se puede recorrer la cadena de esperas para encontrar ciclos.
+
+Para probarlo desde el shell:
+
+```text
+deadlock demo
+deadlock check
+threads
+deadlock resolve
+deadlock check
+threads
+```
+
+`deadlock demo` crea un proceso con dos hilos. Cada uno toma un mutex distinto y después intenta tomar el del otro. `deadlock check` debe mostrar las dos dependencias circulares. `deadlock resolve` despierta a uno de los hilos para que cancele su segunda solicitud, libere el recurso que tenía y permita que el otro continúe.
+
+La demostración necesita algunas conmutaciones del planificador. Si consultas el estado inmediatamente, repite `deadlock check` después de unos instantes.
+
+Fuera de la demostración, `mutex_lock` rechaza la solicitud que formaría un ciclo: devuelve `false` y la rutina llamadora es responsable de liberar los mutex que ya tenía. El mecanismo detecta ciclos entre mutex de una sola instancia; no implementa un algoritmo general para recursos con múltiples instancias ni recupera automáticamente cualquier aplicación.
 
 ## Crear una ISO
 

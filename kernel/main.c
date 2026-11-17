@@ -49,7 +49,8 @@ _Noreturn void kernel_main(uint32_t magic, const multiboot_info_prefix_t *info)
     console_writeln("[OK] Procesos y Round Robin por hilos: quantum de 10 ticks (~100 ms).");
     console_writeln("[OK] Hilos del kernel y mutex con bloqueo/despertar.");
     console_writeln("[OK] Marcos fisicos de 4 KiB y paginacion x86 activa (64 MiB identidad).");
-    console_writeln("[PENDIENTE] Espacios virtuales independientes y deadlocks.");
+    console_writeln("[OK] Deteccion y recuperacion de deadlocks.");
+    console_writeln("[PENDIENTE] Espacios virtuales independientes.");
     console_writeln("Escribe help para ver los comandos.\n");
     interrupts_enable();
     shell_run();
