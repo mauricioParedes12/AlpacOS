@@ -1,72 +1,106 @@
 # AlpacOS
 
-AlpacOS es el mini sistema operativo que estamos desarrollando para el curso de Sistemas Operativos. La idea es llevar a la práctica lo que vemos en clase: desde el arranque del kernel hasta el manejo de procesos, memoria y archivos.
+AlpacOS es el mini sistema operativo que estamos desarrollando para el curso de Sistemas Operativos. El proyecto nos permite llevar a la práctica el arranque de un kernel, la planificación de CPU, los procesos, la sincronización, la memoria y los archivos.
 
-Está escrito en C11 y Assembly (GNU as), para x86 de 32 bits. Lo ejecutamos en QEMU y se puede compilar desde Linux o desde Windows con Ubuntu en WSL2.
+Está escrito en C11 y Assembly de GNU, para x86 de 32 bits (i686). Se ejecuta en QEMU y se puede compilar desde Linux o desde Windows usando Ubuntu en WSL2.
 
-## Avance actual: v0.8.0
+## Versión actual: 0.10.0
 
-El sistema ya arranca con Multiboot y tiene una consola con comandos propios. Cuenta con salida VGA y por puerto serie, teclado PS/2 por interrupciones, un temporizador PIT y un sistema de archivos en RAM. El arranque configura la GDT y la pila; el kernel instala la IDT y el PIC para atender excepciones e interrupciones.
+En esta versión separamos el sistema de archivos en dos partes. El **VFS** resuelve las rutas y dirige las operaciones al sistema de archivos correspondiente. **RAMFS** se encarga de guardar los directorios y el contenido de los archivos en memoria.
 
-En esta versión agregamos hilos del kernel y sincronización. Un proceso puede tener varios hilos, cada uno con su TID, pila y contexto. El planificador Round Robin ahora reparte la CPU entre hilos, no solamente entre procesos.
+Al arrancar, RAMFS queda montado en `/`. Ahora también podemos montar otras instancias en directorios existentes, consultar los montajes y desmontarlos desde la shell. Cada instancia tiene sus propios archivos. Los datos siguen siendo temporales: se pierden al desmontar esa instancia o al reiniciar AlpacOS.
 
-También incorporamos mutex. Cuando un hilo intenta tomar uno que ya está ocupado, queda en estado `BLOCKED`; al liberarlo, se despierta al siguiente hilo que estaba esperando. El shell incluye comandos para crear hilos y revisar sus estados.
+El sistema cuenta con:
 
-En esta versión agregamos un gestor sencillo de marcos físicos de 4 KiB y activamos la paginación de x86. El kernel mantiene un mapeo identidad de los primeros 64 MiB y puede reservar marcos, mapearlos en direcciones virtuales de prueba y liberarlos. `meminfo` muestra ahora los marcos totales, usados y libres; `pagealloc` y `pagefree` permiten comprobar la reserva y liberación desde el shell.
-
-El mapa de memoria es compartido por todo el kernel. Los procesos e hilos todavía no tienen directorios de páginas propios ni aislamiento entre sí. Tampoco hay memoria virtual bajo demanda ni swapping. La detección de deadlocks se agregó en la v0.8.0.
+- Arranque Multiboot v1, GDT, pila e inicialización del kernel.
+- Shell con comandos propios, salida VGA y consola por puerto serie.
+- Interrupciones, temporizador PIT, teclado PS/2 y entrada COM1 con búferes.
+- Procesos con PCB, hilos con TCB y cambio de contexto.
+- Planificación Round Robin por hilos, con un quantum de 10 ticks, aproximadamente 100 ms.
+- Mutex, semáforos, colas de espera, suspensión de hilos e hilo inactivo (`idle`).
+- Gestión de marcos físicos de 4 KiB y paginación con un directorio de páginas por proceso.
+- VFS, RAMFS y hasta cuatro montajes simultáneos, contando la raíz.
+- Detección de ciclos de espera entre mutex y una demostración de recuperación de deadlocks.
 
 ## Compilar y ejecutar
 
-En Ubuntu o WSL2, instala las herramientas y ejecuta estos comandos desde la carpeta del proyecto:
+En Ubuntu, Linux Mint o Ubuntu en WSL2, instala las herramientas:
 
 ```bash
 sudo apt update
 sudo apt install build-essential binutils qemu-system-x86
+```
+
+Desde la raíz del repositorio:
+
+```bash
 make
 make run
 ```
 
-Con `make run`, AlpacOS aparece en la misma terminal a través del puerto serie COM1. Para salir de QEMU, pulsa `Ctrl+A`, suelta las teclas y luego pulsa `X`.
+`make` genera `build/alpacos.elf`. Con `make run`, AlpacOS se usa desde la misma terminal mediante el puerto serie COM1. Para salir de QEMU, pulsa `Ctrl+A`, suelta las teclas y después pulsa `X`.
 
-Si prefieres usar una ventana con pantalla VGA y teclado PS/2:
+Para abrir una ventana con pantalla VGA y teclado PS/2:
 
 ```bash
 make run-gui
 ```
 
-El teclado está configurado con la distribución estadounidense (US).
+Esta opción necesita un entorno gráfico disponible. El teclado PS/2 usa la distribución estadounidense (US). La configuración del proyecto ejecuta QEMU con una CPU y 64 MiB de RAM.
 
-## Comandos
+### Arrancar desde una ISO
 
-| Comando | Para qué sirve |
+La imagen usa GRUB y arranque BIOS:
+
+```bash
+sudo apt install grub-common grub-pc-bin xorriso
+make iso
+make run-iso
+```
+
+La ISO se genera en `build/alpacos.iso`. Para consultar las tareas disponibles, usa `make help`. `make clean` elimina únicamente la carpeta `build/`.
+
+## Comandos de la shell
+
+| Comando | Función |
 |---|---|
-| `help` | Muestra los comandos disponibles. |
-| `clear` | Limpia la pantalla. |
-| `echo hola` | Escribe el texto indicado. |
+| `help` | Lista los comandos disponibles. |
+| `clear` | Limpia la consola. |
+| `echo texto` | Muestra el texto indicado. |
 | `version` | Muestra la versión y la arquitectura. |
-| `uptime` | Indica cuántos segundos lleva encendido el sistema. |
-| `meminfo` | Muestra la RAM reportada, los marcos físicos usados/libres y si la paginación está activa. |
-| `pagealloc` | Reserva un marco físico y lo mapea en una dirección virtual de prueba. |
-| `pagefree 0xD0000000` | Desmapea y libera una página reservada; usa la dirección que mostró `pagealloc`. |
-| `modules` | Muestra qué partes están implementadas y cuáles faltan. |
-| `ps` | Lista los procesos, cuántos hilos tienen y sus contadores de CPU. |
-| `threads` | Muestra TID, PID, estado, ticks y turnos de cada hilo, además del contador compartido de la prueba. |
+| `uptime` | Muestra los segundos transcurridos desde el arranque del temporizador. |
+| `modules` | Resume los módulos implementados. |
+| `ioinfo` | Muestra los contadores de entrada recibida y descartada de COM1 y PS/2. |
+| `meminfo` | Muestra la memoria administrada, los marcos libres y el estado de la paginación. |
+| `pagealloc` | Reserva una página de prueba y comprueba su lectura y escritura. |
+| `pagefree DIRECCION` | Libera una página reservada con `pagealloc`. |
+| `procmap PID` | Muestra el directorio de páginas y el mapeo de la página de datos del proceso. |
+| `faultdemo` | Crea un proceso que provoca un fallo de página. |
+| `ps` | Lista procesos, estados, cantidad de hilos y contadores de CPU. |
+| `threads` | Lista los hilos y muestra los contadores compartidos de la demostración. |
 | `spawn nombre` | Crea un proceso de prueba con su primer hilo. |
-| `thread PID nombre` | Agrega otro hilo al proceso indicado. |
-| `kill PID` | Solicita que terminen los hilos de demostración del proceso. |
-| `ls [/ruta]` | Lista el contenido de un directorio. Sin ruta, muestra `/`. |
-| `mkdir /ruta` | Crea un directorio dentro de otro que ya exista. |
+| `thread PID nombre` | Agrega un hilo al proceso de prueba indicado. |
+| `kill PID` | Termina los hilos del proceso, cancela sus esperas y libera sus recursos. |
+| `deadlock demo` | Inicia la demostración de espera circular entre dos hilos. |
+| `deadlock check` | Muestra las dependencias de espera y comprueba si hay ciclos. |
+| `deadlock resolve` | Cancela una espera del ciclo para permitir la recuperación. |
+| `ls [/ruta]` | Lista un directorio. Sin argumento, lista `/`. |
+| `mkdir /ruta` | Crea un directorio dentro de otro que ya existe. |
 | `touch /ruta` | Crea un archivo vacío. |
 | `write /ruta texto` | Reemplaza el contenido de un archivo existente. |
 | `cat /ruta` | Muestra el contenido de un archivo. |
 | `rm /ruta` | Elimina un archivo. |
-| `rmdir /ruta` | Elimina un directorio vacío. |
-| `halt` | Detiene AlpacOS, aunque la ventana de QEMU sigue abierta. |
+| `rmdir /ruta` | Elimina un directorio vacío que no esté ocupado por montajes. |
+| `mount ramfs /directorio` | Monta una instancia vacía de RAMFS en un directorio existente. |
+| `umount /directorio` | Desmonta esa instancia y descarta sus datos. |
+| `mounts` | Lista los puntos de montaje y sus sistemas de archivos. |
+| `halt` | Detiene AlpacOS. QEMU permanece abierto. |
 
-## Archivos en RAM
+La shell acepta hasta 127 caracteres por línea y 16 palabras, contando el comando. Separa los argumentos por espacios o tabulaciones; no interpreta comillas, redirecciones ni tuberías.
 
-Para probar los archivos, puedes crear una carpeta, guardar una nota y leerla:
+## Archivos y montajes
+
+Para crear y leer un archivo en el sistema raíz:
 
 ```text
 mkdir /docs
@@ -76,26 +110,76 @@ cat /docs/nota.txt
 ls /docs
 ```
 
-`cat` debe mostrar `Hola desde AlpacOS`, y `ls` debe listar `nota.txt`. Para borrar todo lo creado:
+`write` necesita que el archivo ya exista. Para eliminarlo y borrar el directorio:
 
 ```text
 rm /docs/nota.txt
 rmdir /docs
 ```
 
-Los archivos se guardan en RAM, así que se pierden al reiniciar. Por ahora tenemos espacio para 32 entradas, contando la raíz, y hasta 255 caracteres de texto por archivo. Los nombres admiten hasta 23 caracteres y las rutas hasta 127.
+### Probar un montaje
 
-Usamos rutas absolutas, como `/docs/nota.txt`. Los nombres pueden llevar letras, números, `_`, `-` y `.`, pero no espacios; tampoco se aceptan los segmentos `.` y `..`. Primero hay que crear el archivo con `touch`, ya que `write` solo cambia su contenido. El shell separa las palabras por espacios y no interpreta comillas.
+Este ejemplo permite ver la diferencia entre el directorio original y la instancia que se monta sobre él:
 
-Este sistema de archivos todavía no tiene permisos, usuarios, montajes ni almacenamiento en disco.
+```text
+mkdir /mnt
+touch /mnt/original.txt
+write /mnt/original.txt Archivo del sistema raiz
+mount ramfs /mnt
+ls /mnt
+touch /mnt/nuevo.txt
+write /mnt/nuevo.txt Archivo del montaje
+cat /mnt/nuevo.txt
+mounts
+umount /mnt
+ls /mnt
+cat /mnt/original.txt
+```
+
+El primer `ls /mnt`, después de montar RAMFS, muestra un directorio vacío. El archivo `original.txt` queda oculto mientras el montaje está activo. Al desmontarlo, vuelve a aparecer con su contenido; `nuevo.txt` se descarta junto con la instancia desmontada.
+
+También se pueden crear montajes dentro de otros montajes. Para desmontar el padre, primero hay que desmontar sus hijos. El VFS impide borrar un punto de montaje activo, borrar un directorio que lo contiene o desmontar `/`.
+
+Cada instancia de RAMFS admite 32 entradas, contando su raíz. Cada archivo guarda hasta 255 bytes de texto; los nombres admiten hasta 23 caracteres y las rutas completas hasta 127. El límite de línea de la shell puede reducir el texto que se escribe en un solo comando.
+
+Las rutas son absolutas, como `/docs/nota.txt`. Los nombres admiten letras ASCII, números, `_`, `-` y `.`. No se aceptan espacios, rutas relativas, los segmentos `.` y `..`, barras consecutivas ni una barra final, salvo en `/`.
+
+## Procesos, hilos y sincronización
+
+Cada proceso tiene un PCB con su PID, estado, contadores y espacio de direcciones. Cada hilo tiene su propio TID, estado, contexto y pila de 8 KiB. Los hilos de un proceso comparten su espacio de direcciones.
+
+El planificador reparte la CPU entre los hilos listos usando Round Robin. El temporizador permite interrumpir un hilo cuando termina su quantum. Los hilos también pueden ceder la CPU, dormir o bloquearse al esperar un recurso. Cuando no hay trabajo disponible, se ejecuta `idle`.
+
+Para probarlo, crea un proceso:
+
+```text
+spawn grupo
+```
+
+Si el comando devuelve el PID `1`, puedes continuar así. Si devuelve otro número, reemplaza `1` en los comandos:
+
+```text
+thread 1 hiloB
+thread 1 hiloC
+ps
+threads
+procmap 1
+kill 1
+```
+
+Los hilos de esta demostración incrementan un contador compartido protegido por un mutex. Se cede la CPU dentro de la sección crítica para que se pueda observar a otros hilos en `BLOCKED` mientras esperan. El contador sigue aumentando hasta terminar el proceso.
+
+El módulo de sincronización también incluye semáforos con colas de espera. Se usan mediante la API del kernel; esta versión no tiene un comando específico para una demostración productor–consumidor.
+
+Hay espacio para ocho procesos en total: el proceso del sistema con PID 0 y hasta siete procesos de trabajo. El límite es de 24 hilos, incluidos los del shell y `idle`, por lo que quedan hasta 22 hilos de trabajo. El PID 0 está protegido frente a `kill`.
 
 ## Memoria y paginación
 
-El gestor toma la cantidad de memoria básica reportada por Multiboot y administra marcos físicos de 4 KiB. Para evitar pisar el kernel, la pila, las tablas iniciales y los datos de arranque, reserva los primeros 4 MiB (o más si el kernel termina después de esa dirección). Por ahora trabaja con un máximo de 64 MiB.
+AlpacOS administra marcos físicos de 4 KiB. Usa el mapa de memoria que entrega Multiboot cuando está disponible; si no lo está, recurre a la información básica de memoria. Reserva las regiones necesarias para el kernel y el arranque, y administra RAM hasta el límite de 64 MiB.
 
-Al iniciar, AlpacOS crea un directorio de páginas y tablas que mapean de forma identidad los primeros 64 MiB: una dirección virtual apunta al mismo número físico. Después activa el bit de paginación del registro `CR0`. Las tablas necesarias para direcciones virtuales adicionales se crean cuando se mapea una página y se liberan cuando quedan vacías.
+El kernel comparte un mapeo identidad de los primeros 64 MiB, con la página cero ausente para detectar accesos a direcciones nulas. Cada proceso de trabajo tiene su propio directorio de páginas y una página de datos en la dirección virtual `0x40000000`. Esa dirección puede apuntar a marcos físicos distintos en procesos diferentes. `procmap PID` permite observarlo.
 
-Para probarlo desde el shell:
+Para probar la reserva y liberación desde el shell:
 
 ```text
 meminfo
@@ -105,57 +189,17 @@ pagefree 0xD0000000
 meminfo
 ```
 
-`pagealloc` muestra la dirección virtual y el marco físico asignado. También escribe y lee un valor de prueba en esa página. La dirección de ejemplo `0xD0000000` es la primera del área de prueba; usa exactamente la dirección que te devuelva el comando. `pagefree` quita el mapeo y devuelve el marco al allocator.
+Usa en `pagefree` la dirección que muestre `pagealloc`. `0xD0000000` es la primera dirección del área de prueba, que tiene espacio para 16 páginas. Al liberar la última página de una tabla, también se libera esa tabla.
 
-Este avance usa un único directorio de páginas compartido por el kernel, procesos e hilos. El mapeo identidad permite seguir ejecutando el código y las pilas actuales después de activar paginación, pero no proporciona aislamiento entre procesos. El allocator se basa en los campos de memoria básica de Multiboot y limita su administración a los primeros 64 MiB; todavía no interpreta el mapa E820 completo, no implementa espacios de direcciones independientes ni memoria virtual bajo demanda.
+`faultdemo` crea un proceso que intenta escribir en una dirección sin mapear. El manejador registra el fallo y termina ese proceso; la shell sigue funcionando. Un fallo de página en el proceso del sistema detiene el kernel.
 
-## Procesos, hilos y Round Robin
+Aunque los procesos tienen mapeos propios, todos se ejecutan en **ring 0** y comparten las regiones del kernel. Esto todavía no proporciona protección completa entre procesos ni separación entre modo usuario y núcleo. Tampoco hay paginación bajo demanda, reemplazo de páginas o swapping.
 
-Cada proceso tiene un PCB con PID, nombre, estado, contadores y cantidad de hilos. El shell sigue siendo el proceso con PID 0. Se pueden tener hasta siete procesos de prueba activos.
+## Deadlocks
 
-Cada hilo tiene su propio TCB, TID, estado, contexto y pila de 8 KiB. El límite actual es de 24 hilos en total, incluido el hilo del shell. Los hilos de un mismo proceso comparten los datos del kernel; todavía no hay espacios de direcciones separados ni protección entre procesos.
+La detección sigue las dependencias entre hilos: qué mutex espera cada uno y qué hilo lo posee. Si esa cadena forma un ciclo, hay una espera circular.
 
-El planificador usa una cola FIFO de hilos. El quantum sigue siendo de 10 ticks del PIT, aproximadamente 100 ms. Cuando termina el turno, el hilo que estaba ejecutándose vuelve al final de la cola y el siguiente recibe la CPU. El cambio de contexto guarda y restaura los registros desde la interrupción del temporizador.
-
-El módulo de sincronización incluye un mutex no recursivo. Si un hilo intenta bloquear un mutex que pertenece a otro, se agrega a la cola de espera y pasa a `BLOCKED`. Cuando el propietario lo libera, la propiedad se transfiere al siguiente hilo y este vuelve a `READY`. Si un hilo intenta bloquear dos veces el mismo mutex, la operación falla en vez de dejarlo esperando por sí mismo. La detección de ciclos de espera se agregó en la v0.8.0.
-
-### Probar procesos, hilos y mutex
-
-Arranca AlpacOS y ejecuta los comandos usando el PID que muestre `spawn` (no siempre será 1):
-
-```text
-spawn grupo
-thread 4 hiloB
-thread 4 hiloC
-ps
-threads
-```
-
-En este ejemplo, `4` representa el PID devuelto por `spawn`; reemplázalo por el tuyo. El proceso empieza con un hilo y `thread` agrega los demás. Los hilos incrementan continuamente un contador compartido protegido por un mutex. Para que se pueda observar la sincronización, cada hilo cede la CPU mientras mantiene tomado el mutex. Cuando otro hilo intenta entrar, queda en estado `BLOCKED` hasta que el propietario libera el recurso.
-
-El proceso de prueba permanece activo hasta que ejecutes `kill PID`. Ese comando solicita el cierre: cada hilo termina después de salir de su sección crítica y liberar el mutex. Mientras tanto, `ps` muestra el estado del proceso y `threads` permite revisar los TID, los estados y el contador compartido. El valor del contador sigue aumentando mientras los hilos están activos; no hay un resultado fijo como 600.
-
-Los procesos y sus hilos siguen ejecutándose en ring 0 y comparten el espacio de memoria del kernel. El ejemplo usa un contador global asociado al PID; esto sirve para probar la exclusión mutua, pero todavía no equivale a aislamiento de memoria entre procesos.
-
-## Pruebas
-
-Las pruebas del sistema de archivos se ejecutan con:
-
-```bash
-make test
-```
-
-Revisan la creación de archivos y directorios, lectura, escritura, eliminación, límites y errores de rutas. Corren en Linux sin abrir QEMU. Hay más detalles en [docs/pruebas_vfs.md](docs/pruebas_vfs.md).
-
-Para revisar la planificación y los mutex, usa el ejemplo de la sección anterior dentro de QEMU. Comprueba que los tres hilos queden asociados al mismo PID, que cada uno tenga un TID distinto y que el contador compartido aumente. Con varios hilos activos, `threads` debe permitir observar hilos en `BLOCKED` mientras esperan el mutex. Para cerrar la prueba, ejecuta `kill` con el PID del proceso y vuelve a consultar `ps` y `threads`. Para la memoria, ejecuta el ejemplo de `meminfo`, `pagealloc` y `pagefree` de la sección anterior; el número de marcos libres debe bajar al reservar la página y recuperarse al liberarla (la tabla de páginas vacía también se devuelve al allocator).
-
-`make test` solo comprueba el VFS; las pruebas de procesos, hilos, sincronización y paginación se hacen al arrancar el kernel en QEMU. El shell y los comandos de archivos deben seguir funcionando mientras los hilos reciben sus turnos.
-
-## Deadlocks (v0.8.0)
-
-La detección usa el estado real de los mutex: registra qué hilo espera cada recurso y quién lo posee. Como cada mutex tiene un propietario, se puede recorrer la cadena de esperas para encontrar ciclos.
-
-Para probarlo desde el shell:
+Para reproducirla:
 
 ```text
 deadlock demo
@@ -163,23 +207,45 @@ deadlock check
 threads
 deadlock resolve
 deadlock check
-threads
 ```
 
-`deadlock demo` crea un proceso con dos hilos. Cada uno toma un mutex distinto y después intenta tomar el del otro. `deadlock check` debe mostrar las dos dependencias circulares. `deadlock resolve` despierta a uno de los hilos para que cancele su segunda solicitud, libere el recurso que tenía y permita que el otro continúe.
+La demostración crea dos hilos que toman dos mutex en orden inverso. Necesita algunas conmutaciones del planificador; si consultas demasiado pronto, repite `deadlock check` después de unos instantes.
 
-La demostración necesita algunas conmutaciones del planificador. Si consultas el estado inmediatamente, repite `deadlock check` después de unos instantes.
+`deadlock resolve` cancela una de las esperas. El hilo afectado puede reanudarse, liberar el mutex que tenía y permitir que el otro continúe. Si revisas el grafo inmediatamente después, puede hacer falta otra conmutación para ver la recuperación completada.
 
-Fuera de la demostración, `mutex_lock` rechaza la solicitud que formaría un ciclo: devuelve `false` y la rutina llamadora es responsable de liberar los mutex que ya tenía. El mecanismo detecta ciclos entre mutex de una sola instancia; no implementa un algoritmo general para recursos con múltiples instancias ni recupera automáticamente cualquier aplicación.
+Fuera de esta demostración, `mutex_lock` rechaza una solicitud que formaría un ciclo y devuelve `false`. El código que hizo la solicitud debe manejar ese resultado y liberar los recursos que ya posee. La detección se limita a dependencias entre mutex de un solo propietario; no es un detector general de bloqueos entre todos los recursos del sistema.
 
-## Crear una ISO
+## Pruebas
 
-Si quieres arrancar desde una imagen con GRUB:
+Las pruebas incluidas se ejecutan en el equipo anfitrión, sin abrir QEMU:
 
 ```bash
-sudo apt install grub-common grub-pc-bin xorriso
-make iso
-make run-iso
+make test
 ```
 
-La imagen queda en `build/alpacos.iso` y usa arranque BIOS. La carpeta `build/` contiene los archivos generados al compilar y no se sube al repositorio.
+Comprueban las operaciones básicas de archivos y directorios, las rutas inválidas, los límites y el reinicio del VFS. Este comando no ejecuta pruebas del planificador, de la paginación ni de los montajes anidados.
+
+Para comprobar el kernel, ejecuta `make run` y usa los ejemplos anteriores. Al probar montajes, verifica que el contenido original reaparezca al desmontar. En la prueba de memoria, comprueba que los marcos libres se recuperen después de `pagefree`. En las pruebas de procesos y deadlocks, revisa los estados con `ps` y `threads` y confirma que la shell siga respondiendo.
+
+## Organización del código
+
+| Ruta | Contenido |
+|---|---|
+| `boot/` | Arranque Assembly, script del enlazador y configuración de GRUB. |
+| `kernel/` | Inicialización, consola, memoria, procesos, sincronización y deadlocks. |
+| `kernel/interrupts/` | Excepciones, interrupciones y rutinas de entrada Assembly. |
+| `kernel/fs/vfs.c` | Resolución de rutas, nodos y tabla de montajes. |
+| `kernel/fs/ramfs.c` | Directorios y archivos almacenados en RAM. |
+| `kernel/shell/` | Lectura de comandos, análisis de argumentos y ejecución. |
+| `drivers/` | VGA, puerto serie, teclado y temporizador. |
+| `include/alpacos/` | Interfaces y constantes del kernel. |
+| `lib/` | Funciones de cadenas y memoria usadas por el kernel. |
+| `tests/` | Pruebas del sistema de archivos en el anfitrión. |
+
+Los archivos generados al compilar quedan en `build/`.
+
+## Alcance de esta versión
+
+AlpacOS es un sistema educativo para una CPU. `spawn` ejecuta una rutina de demostración compilada dentro del kernel; todavía no carga programas externos. La GDT usa segmentación plana, y la paginación aún no recupera páginas ausentes ni elige páginas para reemplazar.
+
+RAMFS es el único sistema de archivos incluido. El acceso se realiza por rutas y sobre archivos de texto completos: todavía no hay descriptores por proceso, permisos, usuarios ni almacenamiento persistente en disco.

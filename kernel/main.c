@@ -45,7 +45,7 @@ _Noreturn void kernel_main(uint32_t magic, const multiboot_info_prefix_t *info)
     console_writeln(keyboard_ready ? "[OK] Teclado PS/2 US por interrupciones (IRQ1)."
                                   : "[AVISO] Teclado PS/2 no disponible. Usa la terminal serie.");
     console_writeln("[OK] Consola VGA y puerto serie.");
-    console_writeln("[OK] Sistema de archivos virtual en RAM (no persistente).");
+    console_writeln("[OK] VFS con montajes; RAMFS montado en / (no persistente).");
     console_writeln("[OK] Procesos y Round Robin por hilos: quantum de 10 ticks (~100 ms).");
     console_writeln("[OK] Hilos, idle, sleep, mutex y semaforos con colas de espera.");
     console_writeln("[OK] Marcos de 4 KiB, mapa de RAM y paginacion x86 activa.");

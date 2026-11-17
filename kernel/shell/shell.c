@@ -8,6 +8,7 @@
 #include <alpacos/memory.h>
 #include <alpacos/parser.h>
 #include <alpacos/process.h>
+#include <alpacos/ramfs.h>
 #include <alpacos/shell.h>
 #include <alpacos/sync.h>
 #include <alpacos/timer.h>
@@ -42,6 +43,9 @@ static void cmd_write(size_t argc, char **argv);
 static void cmd_cat(size_t argc, char **argv);
 static void cmd_rm(size_t argc, char **argv);
 static void cmd_rmdir(size_t argc, char **argv);
+static void cmd_mount(size_t argc, char **argv);
+static void cmd_umount(size_t argc, char **argv);
+static void cmd_mounts(size_t argc, char **argv);
 static void cmd_ps(size_t argc, char **argv);
 static void cmd_threads(size_t argc, char **argv);
 static void cmd_spawn(size_t argc, char **argv);
@@ -75,6 +79,9 @@ static const command_t commands[] = {
     {"cat", "Lee el archivo: cat /ruta", cmd_cat},
     {"rm", "Elimina un archivo: rm /ruta", cmd_rm},
     {"rmdir", "Elimina directorio vacio: rmdir /ruta", cmd_rmdir},
+    {"mount", "Monta un RAMFS vacio: mount ramfs /directorio", cmd_mount},
+    {"umount", "Desmonta y descarta los datos RAMFS: umount /directorio", cmd_umount},
+    {"mounts", "Lista sistemas de archivos montados", cmd_mounts},
     {"halt", "Detiene la CPU virtual; cierra QEMU para salir", cmd_halt}
 };
 
@@ -267,7 +274,7 @@ static void cmd_modules(size_t argc, char **argv)
     console_writeln("[OK] Mutex, semaforos, sleep e idle; limpieza al finalizar");
     console_writeln("[OK] Allocator de marcos de 4 KiB y paginacion x86 activa");
     console_writeln("[OK] CR3 por proceso y pagina privada en 0x40000000");
-    console_writeln("[OK] VFS en RAM: directorios y archivos (sin persistencia)");
+    console_writeln("[OK] VFS con nodos, operaciones y montajes; backend RAMFS sin persistencia");
     console_writeln("[OK] Deteccion de ciclos y recuperacion de deadlocks con mutex");
 }
 
@@ -578,6 +585,42 @@ static void cmd_rmdir(size_t argc, char **argv)
 {
     if (!require_args(argc, 2u, "rmdir /ruta")) return;
     fs_result(vfs_rmdir(argv[1]));
+}
+
+static void print_mount(const char *path, const char *filesystem, void *context)
+{
+    (void)context;
+    console_write("  ");
+    console_write(path);
+    console_write(" -> ");
+    console_writeln(filesystem);
+}
+
+static void cmd_mounts(size_t argc, char **argv)
+{
+    (void)argv;
+    if (!no_args(argc)) return;
+    fs_result(vfs_list_mounts(print_mount, NULL));
+}
+
+static void cmd_mount(size_t argc, char **argv)
+{
+    if (!require_args(argc, 3u, "mount ramfs /directorio")) return;
+    if (!kstreq(argv[1], ramfs_driver.name)) {
+        console_writeln("Error: sistema de archivos no disponible. Usa ramfs.");
+        return;
+    }
+    vfs_result_t result = vfs_mount(argv[2], &ramfs_driver);
+    if (result == VFS_OK) console_writeln("RAMFS montado: instancia vacia e independiente.");
+    fs_result(result);
+}
+
+static void cmd_umount(size_t argc, char **argv)
+{
+    if (!require_args(argc, 2u, "umount /directorio")) return;
+    vfs_result_t result = vfs_unmount(argv[1]);
+    if (result == VFS_OK) console_writeln("RAMFS desmontado. Sus datos se descartaron.");
+    fs_result(result);
 }
 
 static void cmd_halt(size_t argc, char **argv)

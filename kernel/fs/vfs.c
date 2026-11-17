@@ -1,4 +1,5 @@
 #include <alpacos/kstring.h>
+#include <alpacos/ramfs.h>
 #include <alpacos/vfs.h>
 #include <stdint.h>
 #ifndef ALPACOS_HOST_TEST
@@ -8,205 +9,310 @@ static uint32_t interrupts_save(void) { return 0; }
 static void interrupts_restore(uint32_t flags) { (void)flags; }
 #endif
 
-/* Cada entrada ocupa un espacio fijo. El indice 0 es la raiz "/". */
 typedef struct {
     bool used;
-    bool directory;
-    size_t parent;
-    char name[VFS_NAME_CAPACITY];
-    size_t size;
-    char text[VFS_FILE_CAPACITY];
+    char path[VFS_PATH_CAPACITY];
+    const vfs_driver_t *driver;
+    void *instance;
+    vfs_node_id_t root;
+} vfs_mount_t;
+
+/* Un vnode identifica un nodo junto con el montaje al que pertenece. */
+typedef struct {
+    vfs_mount_t *mount;
+    vfs_node_id_t id;
 } vfs_node_t;
 
-static vfs_node_t nodes[VFS_MAX_NODES];
+static vfs_mount_t mounts[VFS_MAX_MOUNTS];
 
-static bool valid_char(char ch)
+static bool valid_path(const char *path)
 {
-    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-           (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.';
-}
-
-/* Rechaza rutas relativas, vacias, terminadas en '/', '.' y '..'. */
-static bool valid_name(const char *name, size_t length)
-{
-    if (length == 0u || length >= VFS_NAME_CAPACITY) return false;
-    if (length == 1u && name[0] == '.') return false;
-    if (length == 2u && name[0] == '.' && name[1] == '.') return false;
-    for (size_t i = 0; i < length; ++i) {
-        if (!valid_char(name[i])) return false;
+    if (path == NULL || path[0] != '/') return false;
+    size_t length = 0u;
+    while (path[length] != '\0') {
+        if (++length >= VFS_PATH_CAPACITY) return false;
+    }
+    if (length == 1u) return true;
+    if (path[length - 1u] == '/') return false;
+    for (size_t start = 1u; start < length;) {
+        size_t end = start;
+        while (end < length && path[end] != '/') {
+            char ch = path[end++];
+            if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                  (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.'))
+                return false;
+        }
+        size_t size = end - start;
+        if (size == 0u || size >= VFS_NAME_CAPACITY ||
+            (size == 1u && path[start] == '.') ||
+            (size == 2u && path[start] == '.' && path[start + 1u] == '.'))
+            return false;
+        start = end + 1u;
     }
     return true;
 }
 
-static size_t child_of(size_t parent, const char *name, size_t length)
+/* Compara componentes completos: /mnt no contiene /mnt2. */
+static bool within(const char *path, const char *ancestor)
 {
-    for (size_t i = 1u; i < VFS_MAX_NODES; ++i) {
-        if (nodes[i].used && nodes[i].parent == parent &&
-            kstrlen(nodes[i].name) == length &&
-            memcmp(nodes[i].name, name, length) == 0) {
-            return i;
-        }
-    }
-    return VFS_MAX_NODES;
+    size_t length = kstrlen(ancestor);
+    if (length == 1u) return true; /* raiz */
+    return kstrlen(path) >= length && memcmp(path, ancestor, length) == 0 &&
+           (path[length] == '\0' || path[length] == '/');
 }
 
-/* En modo parent_only entrega el padre y el ultimo segmento sin copiarlo. */
-static vfs_result_t resolve(const char *path, bool parent_only,
-                            size_t *index, const char **leaf, size_t *leaf_size)
+static vfs_result_t node_stat(const vfs_node_t *node, vfs_stat_t *info)
 {
-    if (path == NULL || path[0] != '/') return VFS_ERR_INVALID_PATH;
-    size_t path_length = 0u;
-    while (path[path_length] != '\0') {
-        if (++path_length >= VFS_PATH_CAPACITY) return VFS_ERR_INVALID_PATH;
-    }
-    if (path[1] == '\0') {
-        if (parent_only) return VFS_ERR_ROOT;
-        *index = 0u;
-        return VFS_OK;
-    }
-    /* Primero se comprueba toda la sintaxis: una ruta mal formada no debe
-       dar NOT_FOUND solo porque alguno de sus padres aun no existe. */
-    if (path[path_length - 1u] == '/') return VFS_ERR_INVALID_PATH;
-    for (size_t start = 1u; start < path_length;) {
-        size_t end = start;
-        while (end < path_length && path[end] != '/') ++end;
-        if (!valid_name(path + start, end - start)) return VFS_ERR_INVALID_PATH;
-        start = end + 1u;
-    }
+    return node->mount->driver->operations->stat(node->mount->instance, node->id, info);
+}
 
-    size_t current = 0u;
-    const char *part = path + 1;
-    for (;;) {
+static vfs_result_t resolve(const char *path, vfs_node_t *node)
+{
+    if (!valid_path(path)) return VFS_ERR_INVALID_PATH;
+    vfs_mount_t *best = NULL;
+    size_t longest = 0u;
+    for (size_t i = 0u; i < VFS_MAX_MOUNTS; ++i) {
+        if (!mounts[i].used || !within(path, mounts[i].path)) continue;
+        size_t length = kstrlen(mounts[i].path);
+        if (length > longest) { best = &mounts[i]; longest = length; }
+    }
+    if (best == NULL) return VFS_ERR_NOT_FOUND;
+    node->mount = best;
+    node->id = best->root;
+    const char *part = path + longest;
+    if (*part == '/') ++part;
+    while (*part != '\0') {
         const char *end = part;
         while (*end != '\0' && *end != '/') ++end;
-        size_t length = (size_t)(end - part);
-        if (!valid_name(part, length)) return VFS_ERR_INVALID_PATH;
-        bool last = *end == '\0';
-        if (parent_only && last) {
-            *index = current;
-            *leaf = part;
-            *leaf_size = length;
-            return VFS_OK;
-        }
-        size_t next = child_of(current, part, length);
-        if (next == VFS_MAX_NODES) return VFS_ERR_NOT_FOUND;
-        current = next;
-        if (last) {
-            *index = current;
-            return VFS_OK;
-        }
-        if (!nodes[current].directory) return VFS_ERR_NOT_DIR;
-        part = end + 1;
-        if (*part == '\0') return VFS_ERR_INVALID_PATH;
+        vfs_stat_t info;
+        vfs_result_t result = node_stat(node, &info);
+        if (result != VFS_OK) return result;
+        if (!info.is_directory) return VFS_ERR_NOT_DIR;
+        result = best->driver->operations->lookup(best->instance, node->id,
+                                                  part, (size_t)(end - part), &node->id);
+        if (result != VFS_OK) return result;
+        part = *end == '/' ? end + 1 : end;
     }
+    return VFS_OK;
 }
 
-static void locked_init(void)
+static bool covers_mount(const char *path)
 {
-    memset(nodes, 0, sizeof(nodes));
-    nodes[0].used = true;
-    nodes[0].directory = true;
+    for (size_t i = 0u; i < VFS_MAX_MOUNTS; ++i) {
+        if (mounts[i].used && within(mounts[i].path, path)) return true;
+    }
+    return false;
+}
+
+static bool valid_driver(const vfs_driver_t *driver)
+{
+    if (driver == NULL || driver->name == NULL || driver->name[0] == '\0' ||
+        driver->mount == NULL || driver->unmount == NULL || driver->operations == NULL)
+        return false;
+    const vfs_operations_t *ops = driver->operations;
+    return ops->lookup != NULL && ops->stat != NULL && ops->create != NULL &&
+           ops->read != NULL && ops->write != NULL && ops->list != NULL && ops->remove != NULL;
+}
+
+static vfs_result_t locked_mount(const char *path, const vfs_driver_t *driver)
+{
+    if (!valid_path(path)) return VFS_ERR_INVALID_PATH;
+    if (!valid_driver(driver)) return VFS_ERR_INVALID_FS;
+    /* Impide duplicados y ocultar montajes ya existentes bajo este destino. */
+    if (covers_mount(path)) return VFS_ERR_BUSY;
+    if (!kstreq(path, "/")) {
+        vfs_node_t target;
+        vfs_stat_t info;
+        vfs_result_t result = resolve(path, &target);
+        if (result != VFS_OK) return result;
+        result = node_stat(&target, &info);
+        if (result != VFS_OK) return result;
+        if (!info.is_directory) return VFS_ERR_NOT_DIR;
+    }
+    size_t slot = 0u;
+    while (slot < VFS_MAX_MOUNTS && mounts[slot].used) ++slot;
+    if (slot == VFS_MAX_MOUNTS) return VFS_ERR_MOUNT_FULL;
+    void *instance = NULL;
+    vfs_node_id_t root = 0u;
+    vfs_result_t result = driver->mount(&instance, &root);
+    if (result != VFS_OK) return result;
+    vfs_stat_t info;
+    result = driver->operations->stat(instance, root, &info);
+    if (result != VFS_OK || !info.is_directory) {
+        driver->unmount(instance);
+        return result != VFS_OK ? result : VFS_ERR_NOT_DIR;
+    }
+    mounts[slot].driver = driver;
+    mounts[slot].instance = instance;
+    mounts[slot].root = root;
+    memcpy(mounts[slot].path, path, kstrlen(path) + 1u);
+    mounts[slot].used = true;
+    return VFS_OK;
+}
+
+static vfs_result_t locked_unmount(const char *path)
+{
+    if (!valid_path(path)) return VFS_ERR_INVALID_PATH;
+    if (kstreq(path, "/")) return VFS_ERR_ROOT;
+    vfs_mount_t *target = NULL;
+    for (size_t i = 0u; i < VFS_MAX_MOUNTS; ++i) {
+        if (!mounts[i].used) continue;
+        if (kstreq(path, mounts[i].path)) target = &mounts[i];
+        else if (within(mounts[i].path, path)) return VFS_ERR_BUSY;
+    }
+    if (target == NULL) return VFS_ERR_NO_MOUNT;
+    target->driver->unmount(target->instance);
+    memset(target, 0, sizeof(*target));
+    return VFS_OK;
 }
 
 static vfs_result_t create(const char *path, bool directory)
 {
-    size_t parent, name_length;
-    const char *name;
-    vfs_result_t result = resolve(path, true, &parent, &name, &name_length);
+    if (!valid_path(path)) return VFS_ERR_INVALID_PATH;
+    if (kstreq(path, "/")) return VFS_ERR_ROOT;
+    size_t leaf = kstrlen(path);
+    while (path[leaf - 1u] != '/') --leaf;
+    char parent_path[VFS_PATH_CAPACITY];
+    size_t length = leaf == 1u ? 1u : leaf - 1u;
+    memcpy(parent_path, path, length);
+    parent_path[length] = '\0';
+    vfs_node_t parent;
+    vfs_result_t result = resolve(parent_path, &parent);
     if (result != VFS_OK) return result;
-    if (child_of(parent, name, name_length) != VFS_MAX_NODES) return VFS_ERR_EXISTS;
-    for (size_t i = 1u; i < VFS_MAX_NODES; ++i) {
-        if (!nodes[i].used) {
-            memset(&nodes[i], 0, sizeof(nodes[i]));
-            nodes[i].used = true;
-            nodes[i].directory = directory;
-            nodes[i].parent = parent;
-            memcpy(nodes[i].name, name, name_length);
-            nodes[i].name[name_length] = '\0';
-            return VFS_OK;
-        }
-    }
-    return VFS_ERR_FULL;
-}
-
-static vfs_result_t locked_mkdir(const char *path)
-{
-    return create(path, true);
-}
-
-static vfs_result_t locked_touch(const char *path)
-{
-    return create(path, false);
-}
-
-static vfs_result_t locked_write(const char *path, const char *text)
-{
-    size_t index;
-    if (text == NULL) return VFS_ERR_INVALID_PATH;
-    vfs_result_t result = resolve(path, false, &index, NULL, NULL);
+    vfs_stat_t info;
+    result = node_stat(&parent, &info);
     if (result != VFS_OK) return result;
-    if (nodes[index].directory) return VFS_ERR_IS_DIR;
-    size_t length = 0u;
-    while (text[length] != '\0') {
-        if (++length >= VFS_FILE_CAPACITY) return VFS_ERR_TOO_LARGE;
-    }
-    memcpy(nodes[index].text, text, length + 1u);
-    nodes[index].size = length;
-    return VFS_OK;
-}
-
-static vfs_result_t locked_read(const char *path, const char **text, size_t *size)
-{
-    size_t index;
-    if (text == NULL || size == NULL) return VFS_ERR_INVALID_PATH;
-    vfs_result_t result = resolve(path, false, &index, NULL, NULL);
-    if (result != VFS_OK) return result;
-    if (nodes[index].directory) return VFS_ERR_IS_DIR;
-    *text = nodes[index].text;
-    *size = nodes[index].size;
-    return VFS_OK;
-}
-
-static vfs_result_t locked_list(const char *path, vfs_list_callback_t callback, void *context)
-{
-    size_t parent;
-    if (callback == NULL) return VFS_ERR_INVALID_PATH;
-    vfs_result_t result = resolve(path, false, &parent, NULL, NULL);
-    if (result != VFS_OK) return result;
-    if (!nodes[parent].directory) return VFS_ERR_NOT_DIR;
-    for (size_t i = 1u; i < VFS_MAX_NODES; ++i) {
-        if (nodes[i].used && nodes[i].parent == parent) {
-            callback(nodes[i].name, nodes[i].directory, nodes[i].size, context);
-        }
-    }
-    return VFS_OK;
+    if (!info.is_directory) return VFS_ERR_NOT_DIR;
+    return parent.mount->driver->operations->create(parent.mount->instance, parent.id,
+                                                     path + leaf, kstrlen(path + leaf), directory);
 }
 
 static vfs_result_t remove_node(const char *path, bool directory)
 {
-    size_t index;
-    vfs_result_t result = resolve(path, false, &index, NULL, NULL);
+    if (!valid_path(path)) return VFS_ERR_INVALID_PATH;
+    if (kstreq(path, "/")) return VFS_ERR_ROOT;
+    if (covers_mount(path)) return VFS_ERR_BUSY;
+    vfs_node_t node;
+    vfs_result_t result = resolve(path, &node);
     if (result != VFS_OK) return result;
-    if (index == 0u) return VFS_ERR_ROOT;
-    if (directory && !nodes[index].directory) return VFS_ERR_NOT_DIR;
-    if (!directory && nodes[index].directory) return VFS_ERR_IS_DIR;
-    if (directory) {
-        for (size_t i = 1u; i < VFS_MAX_NODES; ++i) {
-            if (nodes[i].used && nodes[i].parent == index) return VFS_ERR_NOT_EMPTY;
-        }
+    return node.mount->driver->operations->remove(node.mount->instance, node.id, directory);
+}
+
+static vfs_result_t locked_mkdir(const char *path) { return create(path, true); }
+static vfs_result_t locked_touch(const char *path) { return create(path, false); }
+static vfs_result_t locked_unlink(const char *path) { return remove_node(path, false); }
+static vfs_result_t locked_rmdir(const char *path) { return remove_node(path, true); }
+
+static vfs_result_t locked_read(const char *path, const char **text, size_t *size)
+{
+    if (text == NULL || size == NULL) return VFS_ERR_INVALID_PATH;
+    vfs_node_t node;
+    vfs_result_t result = resolve(path, &node);
+    if (result != VFS_OK) return result;
+    return node.mount->driver->operations->read(node.mount->instance, node.id, text, size);
+}
+
+void vfs_init(void)
+{
+    uint32_t flags = interrupts_save();
+    for (size_t i = VFS_MAX_MOUNTS; i > 0u; --i) {
+        if (mounts[i - 1u].used)
+            mounts[i - 1u].driver->unmount(mounts[i - 1u].instance);
     }
-    memset(&nodes[index], 0, sizeof(nodes[index]));
+    memset(mounts, 0, sizeof(mounts));
+    /* Unica politica de arranque: la raiz usa RAMFS. Todas las operaciones
+       posteriores se despachan mediante el descriptor del montaje. */
+    (void)locked_mount("/", &ramfs_driver);
+    interrupts_restore(flags);
+}
+
+vfs_result_t vfs_mount(const char *path, const vfs_driver_t *driver)
+{
+    uint32_t flags = interrupts_save();
+    vfs_result_t result = locked_mount(path, driver);
+    interrupts_restore(flags);
+    return result;
+}
+
+#define VFS_SINGLE(name) \
+    vfs_result_t vfs_##name(const char *path) { \
+        uint32_t flags = interrupts_save(); \
+        vfs_result_t result = locked_##name(path); \
+        interrupts_restore(flags); return result; \
+    }
+VFS_SINGLE(mkdir)
+VFS_SINGLE(touch)
+VFS_SINGLE(unlink)
+VFS_SINGLE(rmdir)
+VFS_SINGLE(unmount)
+
+vfs_result_t vfs_stat(const char *path, vfs_stat_t *info)
+{
+    if (info == NULL) return VFS_ERR_INVALID_PATH;
+    uint32_t flags = interrupts_save();
+    vfs_node_t node;
+    vfs_result_t result = resolve(path, &node);
+    if (result == VFS_OK) result = node_stat(&node, info);
+    interrupts_restore(flags);
+    return result;
+}
+
+vfs_result_t vfs_write(const char *path, const char *text)
+{
+    if (text == NULL) return VFS_ERR_INVALID_PATH;
+    uint32_t flags = interrupts_save();
+    vfs_node_t node;
+    vfs_result_t result = resolve(path, &node);
+    if (result == VFS_OK)
+        result = node.mount->driver->operations->write(node.mount->instance, node.id, text);
+    interrupts_restore(flags);
+    return result;
+}
+
+vfs_result_t vfs_read(const char *path, const char **text, size_t *size)
+{
+    uint32_t flags = interrupts_save();
+    vfs_result_t result = locked_read(path, text, size);
+    interrupts_restore(flags);
+    return result;
+}
+
+vfs_result_t vfs_read_copy(const char *path, char *buffer, size_t capacity, size_t *size)
+{
+    if (buffer == NULL || size == NULL) return VFS_ERR_INVALID_PATH;
+    uint32_t flags = interrupts_save();
+    const char *text;
+    size_t length;
+    vfs_result_t result = locked_read(path, &text, &length);
+    if (result == VFS_OK) {
+        if (length >= capacity) result = VFS_ERR_TOO_LARGE;
+        else { memmove(buffer, text, length + 1u); *size = length; }
+    }
+    interrupts_restore(flags);
+    return result;
+}
+
+vfs_result_t vfs_list(const char *path, vfs_list_callback_t callback, void *context)
+{
+    if (callback == NULL) return VFS_ERR_INVALID_PATH;
+    uint32_t flags = interrupts_save();
+    vfs_node_t node;
+    vfs_result_t result = resolve(path, &node);
+    if (result == VFS_OK)
+        result = node.mount->driver->operations->list(node.mount->instance, node.id, callback, context);
+    interrupts_restore(flags);
+    return result;
+}
+
+vfs_result_t vfs_list_mounts(vfs_mount_callback_t callback, void *context)
+{
+    if (callback == NULL) return VFS_ERR_INVALID_PATH;
+    uint32_t flags = interrupts_save();
+    for (size_t i = 0u; i < VFS_MAX_MOUNTS; ++i) {
+        if (mounts[i].used) callback(mounts[i].path, mounts[i].driver->name, context);
+    }
+    interrupts_restore(flags);
     return VFS_OK;
-}
-
-static vfs_result_t locked_unlink(const char *path)
-{
-    return remove_node(path, false);
-}
-
-static vfs_result_t locked_rmdir(const char *path)
-{
-    return remove_node(path, true);
 }
 
 const char *vfs_result_message(vfs_result_t result)
@@ -220,50 +326,12 @@ const char *vfs_result_message(vfs_result_t result)
         case VFS_ERR_IS_DIR: return "La ruta corresponde a un directorio.";
         case VFS_ERR_FULL: return "Sin entradas libres en el sistema de archivos.";
         case VFS_ERR_NOT_EMPTY: return "El directorio no esta vacio.";
-        case VFS_ERR_TOO_LARGE: return "Archivo demasiado grande (maximo 255 caracteres).";
+        case VFS_ERR_TOO_LARGE: return "Contenido demasiado grande o buffer insuficiente.";
         case VFS_ERR_ROOT: return "No se puede modificar la raiz /.";
+        case VFS_ERR_BUSY: return "Ruta ocupada: desmonta los sistemas montados en ella o debajo.";
+        case VFS_ERR_MOUNT_FULL: return "Limite de montajes alcanzado (incluye la raiz).";
+        case VFS_ERR_NO_MOUNT: return "No hay un montaje en esa ruta.";
+        case VFS_ERR_INVALID_FS: return "Controlador de sistema de archivos invalido.";
     }
     return "Error VFS desconocido.";
-}
-
-void vfs_init(void) { uint32_t flags = interrupts_save(); locked_init(); interrupts_restore(flags); }
-#define VFS_SINGLE(name) \
-    vfs_result_t vfs_##name(const char *path) { \
-        uint32_t flags = interrupts_save(); \
-        vfs_result_t result = locked_##name(path); \
-        interrupts_restore(flags); return result; \
-    }
-VFS_SINGLE(mkdir)
-VFS_SINGLE(touch)
-VFS_SINGLE(unlink)
-VFS_SINGLE(rmdir)
-vfs_result_t vfs_write(const char *path, const char *text)
-{
-    uint32_t flags = interrupts_save();
-    vfs_result_t result = locked_write(path, text);
-    interrupts_restore(flags); return result;
-}
-vfs_result_t vfs_read(const char *path, const char **text, size_t *size)
-{
-    uint32_t flags = interrupts_save();
-    vfs_result_t result = locked_read(path, text, size);
-    interrupts_restore(flags); return result;
-}
-vfs_result_t vfs_read_copy(const char *path, char *buffer, size_t capacity, size_t *size)
-{
-    if (buffer == NULL || size == NULL) return VFS_ERR_INVALID_PATH;
-    uint32_t flags = interrupts_save();
-    const char *text; size_t length;
-    vfs_result_t result = locked_read(path, &text, &length);
-    if (result == VFS_OK) {
-        if (length >= capacity) result = VFS_ERR_TOO_LARGE;
-        else { memcpy(buffer, text, length + 1u); *size = length; }
-    }
-    interrupts_restore(flags); return result;
-}
-vfs_result_t vfs_list(const char *path, vfs_list_callback_t callback, void *context)
-{
-    uint32_t flags = interrupts_save();
-    vfs_result_t result = locked_list(path, callback, context);
-    interrupts_restore(flags); return result;
 }

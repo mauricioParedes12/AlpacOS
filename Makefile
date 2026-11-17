@@ -23,7 +23,7 @@ LDFLAGS := -m elf_i386 -nostdlib --build-id=none -T boot/linker.ld \
            -Map=$(BUILD)/alpacos.map
 
 C_SOURCES := kernel/main.c kernel/bootinfo.c kernel/console.c kernel/memory.c kernel/process.c \
-             kernel/interrupts/interrupts.c kernel/sync.c kernel/deadlock.c kernel/fs/vfs.c \
+             kernel/interrupts/interrupts.c kernel/sync.c kernel/deadlock.c kernel/fs/vfs.c kernel/fs/ramfs.c \
              kernel/shell/shell.c kernel/shell/parser.c \
              drivers/vga.c drivers/serial.c drivers/keyboard.c drivers/timer.c \
              lib/kstring.c
@@ -74,11 +74,11 @@ debug: $(KERNEL)
 test: $(BUILD)/test_vfs
 	./$(BUILD)/test_vfs
 
-$(BUILD)/test_vfs: tests/test_vfs.c kernel/fs/vfs.c lib/kstring.c \
-                   include/alpacos/vfs.h include/alpacos/kstring.h
+$(BUILD)/test_vfs: tests/test_vfs.c kernel/fs/vfs.c kernel/fs/ramfs.c lib/kstring.c \
+                   include/alpacos/vfs.h include/alpacos/ramfs.h include/alpacos/kstring.h
 	@mkdir -p $(dir $@)
 	$(HOSTCC) -DALPACOS_HOST_TEST -std=c11 -O2 -fno-builtin -Wall -Wextra -Werror -Wpedantic -Iinclude \
-	    tests/test_vfs.c kernel/fs/vfs.c lib/kstring.c -o $@
+	    tests/test_vfs.c kernel/fs/vfs.c kernel/fs/ramfs.c lib/kstring.c -o $@
 
 clean:
 	rm -rf $(BUILD)
