@@ -2,220 +2,252 @@
 #include <alpacos/kstring.h>
 #include <alpacos/memory.h>
 #include <stddef.h>
+#define ENTRIES 1024u
+#define IDENTITY_TABLES 16u
+#define FRAME_MAX (MEMORY_DIRECT_MAP_LIMIT / MEMORY_PAGE_SIZE)
+#define PRESENT 1u
+#define WRITABLE 2u
+#define ADDRESS 0xFFFFF000u
+/* La clase impide liberar por error una tabla como si fuera un marco suelto. */
+enum { FRAME_FREE, FRAME_RESERVED, FRAME_RAW, FRAME_DIRECTORY, FRAME_TABLE, FRAME_PAGE };
+static uint8_t frame_kind[FRAME_MAX];
+static _Alignas(4096) uint32_t kernel_directory[ENTRIES];
+static _Alignas(4096) uint32_t identity_tables[IDENTITY_TABLES][ENTRIES];
+static memory_space_t active_space;
+static uint32_t total_frames, used_frames, reserved_frames;
+static bool initialized, uses_memory_map;
 
-#define PAGE_ENTRIES 1024u
-#define IDENTITY_TABLE_COUNT (MEMORY_DIRECT_MAP_LIMIT / (PAGE_ENTRIES * MEMORY_PAGE_SIZE))
-#define FRAME_COUNT_MAX (MEMORY_DIRECT_MAP_LIMIT / MEMORY_PAGE_SIZE)
-#define PAGE_PRESENT 0x001u
-#define PAGE_WRITABLE 0x002u
-#define PAGE_ADDRESS_MASK 0xFFFFF000u
-#define PAGE_FLAGS_MASK 0x00000FFFu
-#define MINIMUM_RESERVED_BYTES (4u * 1024u * 1024u)
-
-_Static_assert(IDENTITY_TABLE_COUNT == 16u, "El mapa identidad debe cubrir 64 MiB");
-
-static uint32_t page_directory[PAGE_ENTRIES] __attribute__((aligned(MEMORY_PAGE_SIZE)));
-static uint32_t identity_tables[IDENTITY_TABLE_COUNT][PAGE_ENTRIES]
-    __attribute__((aligned(MEMORY_PAGE_SIZE)));
-static uintptr_t dynamic_table_frames[PAGE_ENTRIES];
-static uint8_t frame_used[FRAME_COUNT_MAX];
-static uint32_t total_frames;
-static uint32_t used_frames;
-static uint32_t reserved_frames;
-static bool initialized;
-
-static uintptr_t frame_alloc_locked(void)
+static uintptr_t allocate(uint8_t kind)
 {
-    for (uint32_t frame = reserved_frames; frame < total_frames; ++frame) {
-        if (frame_used[frame] == 0u) {
-            frame_used[frame] = 1u;
+    for (uint32_t f = 0; f < total_frames; ++f) {
+        if (frame_kind[f] == FRAME_FREE) {
+            frame_kind[f] = kind;
             ++used_frames;
-            return (uintptr_t)frame * MEMORY_PAGE_SIZE;
+            uintptr_t address = f * MEMORY_PAGE_SIZE;
+            memset((void *)address, 0, MEMORY_PAGE_SIZE);
+            return address;
         }
     }
     return 0u;
 }
-
-static bool frame_free_locked(uintptr_t physical_address)
+static bool release(uintptr_t address, uint8_t kind)
 {
-    if ((physical_address & (MEMORY_PAGE_SIZE - 1u)) != 0u) return false;
-    uint32_t frame = (uint32_t)(physical_address / MEMORY_PAGE_SIZE);
-    if (frame < reserved_frames || frame >= total_frames || frame_used[frame] == 0u) {
-        return false;
-    }
-    frame_used[frame] = 0u;
+    if ((address & 4095u) != 0u || address >= total_frames * MEMORY_PAGE_SIZE) return false;
+    uint32_t f = address / MEMORY_PAGE_SIZE;
+    if (frame_kind[f] != kind) return false;
+    frame_kind[f] = FRAME_FREE;
     --used_frames;
     return true;
 }
-
-static uint32_t *page_table_locked(uintptr_t virtual_address, bool create)
+static bool valid_space(memory_space_t space)
 {
-    uint32_t directory_index = (uint32_t)(virtual_address >> 22);
-    uint32_t entry = page_directory[directory_index];
-    if ((entry & PAGE_PRESENT) == 0u) {
-        if (!create) return NULL;
-        uintptr_t table_frame = frame_alloc_locked();
-        if (table_frame == 0u) return NULL;
-        uint32_t *table = (uint32_t *)table_frame; /* Physical RAM is identity-mapped. */
-        memset(table, 0, MEMORY_PAGE_SIZE);
-        dynamic_table_frames[directory_index] = table_frame;
-        page_directory[directory_index] = (uint32_t)table_frame | PAGE_PRESENT | PAGE_WRITABLE;
-        entry = page_directory[directory_index];
-    }
-    return (uint32_t *)(uintptr_t)(entry & PAGE_ADDRESS_MASK);
+    return initialized && (space == (uintptr_t)kernel_directory ||
+        ((space & 4095u) == 0u && space < total_frames * MEMORY_PAGE_SIZE &&
+         frame_kind[space / MEMORY_PAGE_SIZE] == FRAME_DIRECTORY));
 }
-
-static bool map_page_locked(uintptr_t virtual_address, uintptr_t physical_address)
+/* El mapa identidad se comparte y nunca se modifica desde las API publicas. */
+static bool private_address(uintptr_t address)
 {
-    if (((virtual_address | physical_address) & (MEMORY_PAGE_SIZE - 1u)) != 0u ||
-        physical_address >= MEMORY_DIRECT_MAP_LIMIT) return false;
-    uint32_t *table = page_table_locked(virtual_address, true);
-    if (table == NULL) return false;
-    uint32_t table_index = (uint32_t)((virtual_address >> 12) & 0x3FFu);
-    if ((table[table_index] & PAGE_PRESENT) != 0u) return false;
-    table[table_index] = (uint32_t)physical_address | PAGE_PRESENT | PAGE_WRITABLE;
-    __asm__ volatile ("invlpg (%0)" : : "r"(virtual_address) : "memory");
+    return address >= MEMORY_DIRECT_MAP_LIMIT && (address & 4095u) == 0u;
+}
+static void invalidate(memory_space_t space, uintptr_t address)
+{
+    if (space == active_space) __asm__ volatile ("invlpg (%0)" : : "r"(address) : "memory");
+}
+static void mark_range(uint64_t start, uint64_t length, bool usable)
+{
+    uint64_t end = start + length;
+    if (end < start) end = UINT64_MAX;
+    if (start >= MEMORY_DIRECT_MAP_LIMIT) return;
+    if (end > MEMORY_DIRECT_MAP_LIMIT) end = MEMORY_DIRECT_MAP_LIMIT;
+    uint32_t first = usable ? (uint32_t)((start + 4095u) >> 12) : (uint32_t)(start >> 12);
+    uint32_t last = usable ? (uint32_t)(end >> 12) : (uint32_t)((end + 4095u) >> 12);
+    for (uint32_t f = first; f < last; ++f) frame_kind[f] = usable ? FRAME_FREE : FRAME_RESERVED;
+    if (usable && last > total_frames) total_frames = last;
+}
+static bool apply_map(const boot_info_t *boot, bool usable_pass)
+{
+    uintptr_t base = (uintptr_t)boot->memory_map;
+    if (boot->memory_map_bytes > UINT32_MAX - base) return false;
+    uint32_t offset = 0;
+    while (offset < boot->memory_map_bytes) {
+        if (boot->memory_map_bytes - offset < 4u) return false;
+        const multiboot_memory_entry_t *entry = (const void *)(base + offset);
+        if (entry->size < 20u || entry->size > boot->memory_map_bytes - offset - 4u) return false;
+        if ((entry->type == 1u) == usable_pass) mark_range(entry->address, entry->length, usable_pass);
+        offset += entry->size + 4u;
+    }
     return true;
 }
-
-static bool unmap_page_locked(uintptr_t virtual_address, uintptr_t *physical_out)
+bool memory_init(const boot_info_t *boot)
 {
-    if ((virtual_address & (MEMORY_PAGE_SIZE - 1u)) != 0u ||
-        virtual_address < MEMORY_DIRECT_MAP_LIMIT) return false;
-    uint32_t *table = page_table_locked(virtual_address, false);
-    if (table == NULL) return false;
-    uint32_t table_index = (uint32_t)((virtual_address >> 12) & 0x3FFu);
-    uint32_t entry = table[table_index];
-    if ((entry & PAGE_PRESENT) == 0u) return false;
-    table[table_index] = 0u;
-    __asm__ volatile ("invlpg (%0)" : : "r"(virtual_address) : "memory");
-
-    uint32_t directory_index = (uint32_t)(virtual_address >> 22);
-    if (dynamic_table_frames[directory_index] != 0u) {
-        bool empty = true;
-        for (uint32_t i = 0u; i < PAGE_ENTRIES; ++i) {
-            if ((table[i] & PAGE_PRESENT) != 0u) {
-                empty = false;
-                break;
-            }
-        }
-        if (empty) {
-            uintptr_t table_frame = dynamic_table_frames[directory_index];
-            page_directory[directory_index] = 0u;
-            dynamic_table_frames[directory_index] = 0u;
-            (void)frame_free_locked(table_frame);
-        }
+    if (initialized || boot == NULL) return false;
+    memset(frame_kind, FRAME_RESERVED, sizeof(frame_kind));
+    total_frames = 0;
+    uses_memory_map = boot->has_memory_map;
+    if (uses_memory_map) {
+        if (!apply_map(boot, true) || !apply_map(boot, false)) return false;
+    } else if (boot->memory_available) {
+        mark_range(0u, (uint64_t)boot->lower_kib << 10, true);
+        /* mem_upper comienza en 1 MiB, no en el final de mem_lower. */
+        mark_range(0x100000u, (uint64_t)boot->upper_kib << 10, true);
+    } else return false;
+    mark_range(0, boot->kernel_end > 0x400000u ? boot->kernel_end : 0x400000u, false);
+    mark_range(boot->information_address, sizeof(multiboot_info_prefix_t), false);
+    if (boot->has_memory_map) mark_range((uintptr_t)boot->memory_map, boot->memory_map_bytes, false);
+    mark_range((uintptr_t)boot->modules, (uint64_t)boot->module_count * sizeof(multiboot_module_t), false);
+    for (uint32_t i = 0; i < boot->module_count; ++i) {
+        if (boot->modules[i].end < boot->modules[i].start) return false;
+        mark_range(boot->modules[i].start, boot->modules[i].end - boot->modules[i].start, false);
     }
-    if (physical_out != NULL) *physical_out = (uintptr_t)(entry & PAGE_ADDRESS_MASK);
-    return true;
-}
-
-bool memory_init(uint32_t lower_kib, uint32_t upper_kib, uintptr_t kernel_end)
-{
-    if (initialized) return false;
-    uint64_t reported_kib = (uint64_t)lower_kib + (uint64_t)upper_kib;
-    uint64_t reported_bytes = reported_kib << 10;
-    uint32_t frames = (uint32_t)(reported_bytes / MEMORY_PAGE_SIZE);
-    if (frames > FRAME_COUNT_MAX) frames = FRAME_COUNT_MAX;
-    if (frames <= (MINIMUM_RESERVED_BYTES / MEMORY_PAGE_SIZE)) return false;
-
-    uint32_t kernel_limit = (uint32_t)kernel_end;
-    if (kernel_limit < MINIMUM_RESERVED_BYTES) kernel_limit = MINIMUM_RESERVED_BYTES;
-    kernel_limit = (kernel_limit + MEMORY_PAGE_SIZE - 1u) & ~(MEMORY_PAGE_SIZE - 1u);
-    reserved_frames = kernel_limit / MEMORY_PAGE_SIZE;
-    if (reserved_frames >= frames) return false;
-
-    total_frames = frames;
+    reserved_frames = 0;
+    for (uint32_t f = 0; f < total_frames; ++f) if (frame_kind[f] == FRAME_RESERVED) ++reserved_frames;
     used_frames = reserved_frames;
-    memset(frame_used, 0, sizeof(frame_used));
-    for (uint32_t i = 0u; i < reserved_frames; ++i) frame_used[i] = 1u;
-    memset(page_directory, 0, sizeof(page_directory));
-    memset(identity_tables, 0, sizeof(identity_tables));
-    memset(dynamic_table_frames, 0, sizeof(dynamic_table_frames));
-
-    for (uint32_t table = 0u; table < IDENTITY_TABLE_COUNT; ++table) {
-        for (uint32_t page = 0u; page < PAGE_ENTRIES; ++page) {
-            uint32_t address = (table * PAGE_ENTRIES + page) * MEMORY_PAGE_SIZE;
-            identity_tables[table][page] = address | PAGE_PRESENT | PAGE_WRITABLE;
+    if (used_frames >= total_frames) return false;
+    memset(kernel_directory, 0, sizeof(kernel_directory));
+    for (uint32_t t = 0; t < IDENTITY_TABLES; ++t) {
+        for (uint32_t p = 0; p < ENTRIES; ++p) {
+            /* La pagina cero queda ausente para detectar punteros NULL. */
+            uint32_t physical = (t * ENTRIES + p) * MEMORY_PAGE_SIZE;
+            identity_tables[t][p] = physical == 0u ? 0u : physical | PRESENT | WRITABLE;
         }
-        page_directory[table] = (uint32_t)(uintptr_t)&identity_tables[table][0] |
-                                PAGE_PRESENT | PAGE_WRITABLE;
+        kernel_directory[t] = (uintptr_t)identity_tables[t] | PRESENT | WRITABLE;
     }
-
-    uint32_t directory_address = (uint32_t)(uintptr_t)page_directory;
+    active_space = (uintptr_t)kernel_directory;
+    __asm__ volatile ("movl %0, %%cr3" : : "r"(active_space) : "memory");
     uint32_t cr0;
-    __asm__ volatile ("movl %0, %%cr3" : : "r"(directory_address) : "memory");
     __asm__ volatile ("movl %%cr0, %0" : "=r"(cr0));
-    cr0 |= 0x80010000u; /* PG: paging; WP: honor read-only PTEs in ring 0. */
+    cr0 |= 0x80010000u;
     __asm__ volatile ("movl %0, %%cr0" : : "r"(cr0) : "memory");
     initialized = true;
     return true;
 }
-
 uintptr_t memory_frame_alloc(void)
 {
     uint32_t flags = interrupts_save();
-    uintptr_t result = initialized ? frame_alloc_locked() : 0u;
+    uintptr_t result = initialized ? allocate(FRAME_RAW) : 0u;
     interrupts_restore(flags);
     return result;
 }
-
-bool memory_frame_free(uintptr_t physical_address)
+bool memory_frame_free(uintptr_t address)
 {
     uint32_t flags = interrupts_save();
-    bool result = initialized && frame_free_locked(physical_address);
+    bool result = initialized && release(address, FRAME_RAW);
     interrupts_restore(flags);
     return result;
 }
-
-bool memory_page_alloc(uintptr_t virtual_address, uintptr_t *physical_out)
+memory_space_t memory_space_kernel(void) { return (uintptr_t)kernel_directory; }
+memory_space_t memory_space_current(void) { return active_space; }
+memory_space_t memory_space_create(void)
 {
-    if (!initialized || physical_out == NULL) return false;
     uint32_t flags = interrupts_save();
-    uintptr_t frame = frame_alloc_locked();
-    bool result = frame != 0u && map_page_locked(virtual_address, frame);
-    if (!result && frame != 0u) (void)frame_free_locked(frame);
-    if (result) *physical_out = frame;
+    uintptr_t address = initialized ? allocate(FRAME_DIRECTORY) : 0u;
+    if (address != 0u) memcpy((void *)address, kernel_directory, IDENTITY_TABLES * sizeof(uint32_t));
     interrupts_restore(flags);
-    return result;
+    return address;
 }
-
-bool memory_page_free(uintptr_t virtual_address, uintptr_t *physical_out)
+void memory_space_activate(memory_space_t space)
 {
-    if (!initialized) return false;
+    if (space != active_space && valid_space(space)) {
+        active_space = space;
+        __asm__ volatile ("movl %0, %%cr3" : : "r"(space) : "memory");
+    }
+}
+bool memory_space_alloc(memory_space_t space, uintptr_t address, uintptr_t *physical_out)
+{
     uint32_t flags = interrupts_save();
-    uintptr_t frame = 0u;
-    bool result = unmap_page_locked(virtual_address, &frame);
-    if (result) result = frame_free_locked(frame);
-    if (result && physical_out != NULL) *physical_out = frame;
+    if (!valid_space(space) || !private_address(address) || physical_out == NULL) {
+        interrupts_restore(flags); return false;
+    }
+    uint32_t *directory = (void *)space;
+    uint32_t d = address >> 22, p = (address >> 12) & 1023u;
+    bool new_table = (directory[d] & PRESENT) == 0u;
+    uintptr_t table_address = directory[d] & ADDRESS;
+    if (new_table) table_address = allocate(FRAME_TABLE);
+    if (table_address == 0u) { interrupts_restore(flags); return false; }
+    uint32_t *table = (void *)table_address;
+    if ((table[p] & PRESENT) != 0u) { interrupts_restore(flags); return false; }
+    uintptr_t physical = allocate(FRAME_PAGE);
+    if (physical == 0u) {
+        if (new_table) (void)release(table_address, FRAME_TABLE);
+        interrupts_restore(flags); return false;
+    }
+    directory[d] = table_address | PRESENT | WRITABLE;
+    table[p] = physical | PRESENT | WRITABLE;
+    invalidate(space, address);
+    *physical_out = physical;
     interrupts_restore(flags);
-    return result;
+    return true;
 }
-
-bool memory_page_is_mapped(uintptr_t virtual_address)
+bool memory_space_free(memory_space_t space, uintptr_t address, uintptr_t *physical_out)
 {
-    if (!initialized) return false;
     uint32_t flags = interrupts_save();
-    uint32_t *table = page_table_locked(virtual_address, false);
-    bool mapped = false;
-    if (table != NULL) {
-        uint32_t index = (uint32_t)((virtual_address >> 12) & 0x3FFu);
-        mapped = (table[index] & PAGE_PRESENT) != 0u;
+    if (!valid_space(space) || !private_address(address)) { interrupts_restore(flags); return false; }
+    uint32_t *directory = (void *)space;
+    uint32_t d = address >> 22, p = (address >> 12) & 1023u;
+    if ((directory[d] & PRESENT) == 0u) { interrupts_restore(flags); return false; }
+    uint32_t *table = (void *)(uintptr_t)(directory[d] & ADDRESS);
+    uintptr_t physical = table[p] & ADDRESS;
+    if ((table[p] & PRESENT) == 0u || !release(physical, FRAME_PAGE)) {
+        interrupts_restore(flags); return false;
+    }
+    table[p] = 0u;
+    invalidate(space, address);
+    bool empty = true;
+    for (uint32_t i = 0; i < ENTRIES; ++i) if ((table[i] & PRESENT) != 0u) { empty = false; break; }
+    if (empty) {
+        uintptr_t frame = directory[d] & ADDRESS;
+        directory[d] = 0u;
+        (void)release(frame, FRAME_TABLE);
+    }
+    if (physical_out != NULL) *physical_out = physical;
+    interrupts_restore(flags);
+    return true;
+}
+bool memory_space_translate(memory_space_t space, uintptr_t address, uintptr_t *physical_out)
+{
+    uint32_t flags = interrupts_save();
+    bool result = false;
+    if (valid_space(space) && physical_out != NULL) {
+        uint32_t *directory = (void *)space;
+        uint32_t entry = directory[address >> 22];
+        if ((entry & PRESENT) != 0u) {
+            uint32_t *table = (void *)(uintptr_t)(entry & ADDRESS);
+            entry = table[(address >> 12) & 1023u];
+            if ((entry & PRESENT) != 0u) { *physical_out = (entry & ADDRESS) | (address & 4095u); result = true; }
+        }
     }
     interrupts_restore(flags);
-    return mapped;
+    return result;
 }
-
+bool memory_space_destroy(memory_space_t space)
+{
+    uint32_t flags = interrupts_save();
+    if (!valid_space(space) || space == active_space || space == memory_space_kernel()) {
+        interrupts_restore(flags); return false;
+    }
+    uint32_t *directory = (void *)space;
+    for (uint32_t d = IDENTITY_TABLES; d < ENTRIES; ++d) {
+        if ((directory[d] & PRESENT) == 0u) continue;
+        uint32_t *table = (void *)(uintptr_t)(directory[d] & ADDRESS);
+        for (uint32_t p = 0; p < ENTRIES; ++p) {
+            if ((table[p] & PRESENT) != 0u) (void)release(table[p] & ADDRESS, FRAME_PAGE);
+        }
+        (void)release(directory[d] & ADDRESS, FRAME_TABLE);
+    }
+    bool result = release(space, FRAME_DIRECTORY);
+    interrupts_restore(flags);
+    return result;
+}
+bool memory_page_alloc(uintptr_t address, uintptr_t *physical_out) { return memory_space_alloc(active_space, address, physical_out); }
+bool memory_page_free(uintptr_t address, uintptr_t *physical_out) { return memory_space_free(active_space, address, physical_out); }
+bool memory_page_is_mapped(uintptr_t address) { uintptr_t physical; return memory_space_translate(active_space, address, &physical); }
 void memory_get_stats(memory_stats_t *stats)
 {
     if (stats == NULL) return;
-    uint32_t flags = interrupts_save();
-    stats->total_frames = total_frames;
-    stats->used_frames = used_frames;
-    stats->free_frames = total_frames - used_frames;
-    stats->reserved_frames = reserved_frames;
-    uint32_t cr0;
+    uint32_t flags = interrupts_save(), cr0;
     __asm__ volatile ("movl %%cr0, %0" : "=r"(cr0));
-    stats->paging_enabled = initialized && (cr0 & 0x80000000u) != 0u;
+    *stats = (memory_stats_t){total_frames, used_frames, total_frames - used_frames,
+        reserved_frames, initialized && (cr0 & 0x80000000u) != 0u, uses_memory_map};
     interrupts_restore(flags);
 }

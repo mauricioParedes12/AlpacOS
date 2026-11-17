@@ -77,7 +77,7 @@ test: $(BUILD)/test_vfs
 $(BUILD)/test_vfs: tests/test_vfs.c kernel/fs/vfs.c lib/kstring.c \
                    include/alpacos/vfs.h include/alpacos/kstring.h
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -std=c11 -O2 -fno-builtin -Wall -Wextra -Werror -Wpedantic -Iinclude \
+	$(HOSTCC) -DALPACOS_HOST_TEST -std=c11 -O2 -fno-builtin -Wall -Wextra -Werror -Wpedantic -Iinclude \
 	    tests/test_vfs.c kernel/fs/vfs.c lib/kstring.c -o $@
 
 clean:

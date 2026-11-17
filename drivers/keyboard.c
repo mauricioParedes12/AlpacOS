@@ -30,6 +30,7 @@ static unsigned skip;
 static char buffer[128];
 static unsigned head;
 static unsigned tail;
+static input_stats_t stats;
 
 static int decode_scancode(uint8_t code)
 {
@@ -78,8 +79,9 @@ static void keyboard_interrupt(void)
     if ((status & 0xE0u) != 0u) return; /* Mouse, paridad o timeout. */
     int c = decode_scancode(code);
     if (c < 0) return;
+    ++stats.received;
     unsigned next = (head + 1u) % sizeof(buffer);
-    if (next == tail) return; /* Buffer lleno: descartar sin bloquear la IRQ. */
+    if (next == tail) { ++stats.dropped; return; } /* Buffer lleno: descartar sin bloquear la IRQ. */
     buffer[head] = (char)c;
     head = next;
 }
@@ -129,4 +131,11 @@ int keyboard_read(void)
     }
     interrupts_restore(flags);
     return c;
+}
+
+void keyboard_get_stats(input_stats_t *out)
+{
+    uint32_t flags = interrupts_save();
+    if (out != 0) *out = stats;
+    interrupts_restore(flags);
 }

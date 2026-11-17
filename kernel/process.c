@@ -2,6 +2,7 @@
 #include <alpacos/io.h>
 #include <alpacos/kstring.h>
 #include <alpacos/process.h>
+#include <alpacos/sync.h>
 
 #define THREAD_STACK_WORDS 2048u /* 8 KiB por hilo. */
 
@@ -14,6 +15,7 @@ typedef struct {
     interrupt_frame_t *context;
     thread_entry_t entry;
     size_t process_slot;
+    uint32_t wake_tick;
 } tcb_t;
 
 static pcb_t processes[PROCESS_MAX];
@@ -23,6 +25,8 @@ static size_t current_thread;
 static uint32_t next_pid;
 static uint32_t next_tid;
 static unsigned slice_ticks;
+static uint32_t scheduler_ticks;
+#define IDLE_SLOT 1u
 
 /* La cola contiene indices de TCB; el hilo RUNNING no esta en ella. */
 static size_t ready[THREAD_MAX];
@@ -30,6 +34,7 @@ static size_t ready_head;
 static size_t ready_count;
 
 static _Noreturn void thread_start(void);
+static void idle_entry(void) { for (;;) interrupts_wait(); }
 
 static bool valid_name(const char *name, size_t capacity, size_t *length)
 {
@@ -80,7 +85,7 @@ static void refresh_process_state(size_t process_slot)
         ++active;
         if (thread->info.state == THREAD_RUNNING) running = true;
         if (thread->info.state == THREAD_READY) ready_thread = true;
-        if (thread->info.state == THREAD_BLOCKED) blocked = true;
+        if (thread->info.state == THREAD_BLOCKED || thread->info.state == THREAD_SLEEPING) blocked = true;
     }
 
     process->info.thread_count = active;
@@ -107,7 +112,7 @@ static size_t find_process(uint32_t pid)
 
 static size_t find_free_thread(void)
 {
-    for (size_t i = 1u; i < THREAD_MAX; ++i) {
+    for (size_t i = 2u; i < THREAD_MAX; ++i) {
         if (threads[i].info.state == THREAD_UNUSED ||
             threads[i].info.state == THREAD_TERMINATED) return i;
     }
@@ -123,11 +128,10 @@ static size_t find_free_process(void)
     return PROCESS_MAX;
 }
 
-static size_t create_thread(size_t process_slot, const char *name,
+static size_t create_thread_at(size_t slot, size_t process_slot, const char *name,
                             size_t name_length, thread_entry_t entry)
 {
-    size_t slot = find_free_thread();
-    if (slot == THREAD_MAX || next_tid == 0u) return THREAD_MAX;
+    if (slot == THREAD_MAX || next_tid == 0u || next_tid == UINT32_MAX) return THREAD_MAX;
 
     tcb_t *thread = &threads[slot];
     memset(thread, 0, sizeof(*thread));
@@ -149,7 +153,7 @@ static size_t create_thread(size_t process_slot, const char *name,
     frame->cs = 0x08u;
     frame->eflags = 0x202u; /* IF activo, DF desactivado. */
     thread->context = frame;
-    ready_push(slot);
+    if (slot != IDLE_SLOT) ready_push(slot);
     return slot;
 }
 
@@ -166,18 +170,23 @@ void process_init(void)
     current_thread = ready_head = ready_count = 0u;
     slice_ticks = 0u;
     next_pid = 1u;
-    next_tid = 1u;
+    next_tid = 2u;
+    scheduler_ticks = 0u;
 
     processes[0].info.pid = 0u;
     memcpy(processes[0].info.name, "shell", sizeof("shell"));
     processes[0].info.state = PROCESS_RUNNING;
-    processes[0].info.thread_count = 1u;
+    processes[0].info.thread_count = 2u;
+    processes[0].info.address_space = memory_space_kernel();
 
     threads[0].info.tid = 0u;
     threads[0].info.pid = 0u;
     memcpy(threads[0].info.name, "shell", sizeof("shell"));
     threads[0].info.state = THREAD_RUNNING;
     threads[0].process_slot = 0u;
+    (void)create_thread_at(IDLE_SLOT, 0u, "idle", 4u, idle_entry);
+    threads[IDLE_SLOT].info.tid = 1u;
+    next_tid = 2u;
     /* El primer IRQ guarda el contexto del shell en su pila original. */
 }
 
@@ -202,8 +211,16 @@ uint32_t process_spawn(const char *name, process_entry_t entry)
     process->info.pid = next_pid++;
     memcpy(process->info.name, name, length + 1u);
     process->info.state = PROCESS_READY;
-
-    if (create_thread(process_slot, name, length, entry) == THREAD_MAX) {
+    process->info.address_space = memory_space_create();
+    if (process->info.address_space == 0u ||
+        !memory_space_alloc(process->info.address_space, MEMORY_PROCESS_BASE, &process->info.private_frame)) {
+        if (process->info.address_space != 0u) (void)memory_space_destroy(process->info.address_space);
+        memset(process, 0, sizeof(*process));
+        interrupts_restore(flags);
+        return 0u;
+    }
+    if (create_thread_at(find_free_thread(), process_slot, name, length, entry) == THREAD_MAX) {
+        (void)memory_space_destroy(process->info.address_space);
         memset(process, 0, sizeof(*process));
         interrupts_restore(flags);
         return 0u;
@@ -220,7 +237,8 @@ uint32_t thread_spawn(uint32_t pid, const char *name, thread_entry_t entry)
     if (!valid_name(name, THREAD_NAME_CAPACITY, &length) || entry == NULL) return 0u;
 
     uint32_t flags = interrupts_save();
-    if (threads[current_thread].process_slot != 0u) {
+    if (pid == 0u || (threads[current_thread].process_slot != 0u &&
+        threads[current_thread].info.pid != pid)) {
         interrupts_restore(flags);
         return 0u;
     }
@@ -229,7 +247,7 @@ uint32_t thread_spawn(uint32_t pid, const char *name, thread_entry_t entry)
         interrupts_restore(flags);
         return 0u;
     }
-    size_t thread_slot = create_thread(process_slot, name, length, entry);
+    size_t thread_slot = create_thread_at(find_free_thread(), process_slot, name, length, entry);
     if (thread_slot == THREAD_MAX) {
         interrupts_restore(flags);
         return 0u;
@@ -240,86 +258,100 @@ uint32_t thread_spawn(uint32_t pid, const char *name, thread_entry_t entry)
     return tid;
 }
 
-/* Se ejecuta al salir de IRQ0 o int 0x80; nunca cambia de pila dentro de C. */
+/* Primero se cambia CR3; despues se pueden devolver las paginas del anterior.
+ * Las pilas y el codigo del kernel tienen el mismo mapeo en todos los espacios. */
+static void reap_spaces(void)
+{
+    for (size_t i = 1u; i < PROCESS_MAX; ++i) {
+        process_info_t *p = &processes[i].info;
+        if (p->state == PROCESS_TERMINATED && p->address_space != 0u &&
+            memory_space_destroy(p->address_space)) {
+            p->address_space = 0u;
+            p->private_frame = 0u;
+        }
+    }
+}
 interrupt_frame_t *process_schedule(interrupt_frame_t *frame, bool timer_tick)
 {
     tcb_t *old = &threads[current_thread];
     old->context = frame;
-
     if (timer_tick) {
+        ++scheduler_ticks;
+        for (size_t i = 0; i < THREAD_MAX; ++i) {
+            if (threads[i].info.state == THREAD_SLEEPING &&
+                (int32_t)(scheduler_ticks - threads[i].wake_tick) >= 0) {
+                threads[i].info.state = THREAD_READY;
+                ready_push(i);
+                refresh_process_state(threads[i].process_slot);
+            }
+        }
         ++old->info.cpu_ticks;
         ++processes[old->process_slot].info.cpu_ticks;
-        if (++slice_ticks < PROCESS_QUANTUM_TICKS) return frame;
+        if (++slice_ticks < PROCESS_QUANTUM_TICKS && current_thread != IDLE_SLOT) return frame;
     }
     slice_ticks = 0u;
-
     if (old->info.state == THREAD_RUNNING) {
-        if (ready_count == 0u) return frame;
         old->info.state = THREAD_READY;
-        ready_push(current_thread);
+        if (current_thread != IDLE_SLOT) ready_push(current_thread);
         refresh_process_state(old->process_slot);
     }
-
-    /* thread_block_current comprueba que exista otro hilo antes de bloquear. */
-    if (ready_count == 0u) {
-        old->info.state = THREAD_RUNNING;
-        refresh_process_state(old->process_slot);
-        return frame;
-    }
-
-    current_thread = ready_pop();
+    current_thread = ready_count != 0u ? ready_pop() : IDLE_SLOT;
     tcb_t *next = &threads[current_thread];
     next->info.state = THREAD_RUNNING;
     ++next->info.turns;
     ++processes[next->process_slot].info.turns;
     refresh_process_state(next->process_slot);
+    memory_space_activate(processes[next->process_slot].info.address_space);
+    reap_spaces();
     return next->context;
 }
-
-_Noreturn void thread_exit(void)
+static void terminate_process(size_t slot, int32_t status)
 {
-    interrupts_disable();
-    if (current_thread == 0u) cpu_halt();
-    threads[current_thread].info.state = THREAD_TERMINATED;
-    refresh_process_state(threads[current_thread].process_slot);
-    process_yield();
-    cpu_halt(); /* Un hilo terminado no vuelve a la cola. */
-}
-
-_Noreturn void process_exit(void)
-{
-    thread_exit();
-}
-
-bool process_kill(uint32_t pid)
-{
-    uint32_t flags = interrupts_save();
-    if (pid == 0u || threads[current_thread].process_slot != 0u) {
-        interrupts_restore(flags);
-        return false;
-    }
-    size_t process_slot = find_process(pid);
-    if (process_slot == PROCESS_MAX) {
-        interrupts_restore(flags);
-        return false;
-    }
-
-    /* No se eliminan hilos bloqueados: un mutex podria conservar su TID. */
-    for (size_t i = 1u; i < THREAD_MAX; ++i) {
-        if (threads[i].process_slot == process_slot &&
-            threads[i].info.state == THREAD_BLOCKED) {
-            interrupts_restore(flags);
-            return false;
-        }
-    }
-    for (size_t i = 1u; i < THREAD_MAX; ++i) {
-        if (threads[i].process_slot == process_slot &&
-            threads[i].info.state == THREAD_READY) {
+    /* Marcar primero impide transferir un mutex a otro hilo que tambien muere. */
+    for (size_t i = 2u; i < THREAD_MAX; ++i) {
+        if (threads[i].process_slot == slot && threads[i].info.state != THREAD_UNUSED &&
+            threads[i].info.state != THREAD_TERMINATED) {
             ready_remove(i);
             threads[i].info.state = THREAD_TERMINATED;
         }
     }
-    refresh_process_state(process_slot);
+    for (size_t i = 2u; i < THREAD_MAX; ++i) {
+        if (threads[i].process_slot == slot && threads[i].info.state == THREAD_TERMINATED)
+            sync_thread_cleanup(threads[i].info.tid);
+    }
+    processes[slot].info.exit_status = status;
+    refresh_process_state(slot);
+}
+_Noreturn void thread_exit(void)
+{
+    interrupts_disable();
+    if (current_thread < 2u) cpu_halt();
+    threads[current_thread].info.state = THREAD_TERMINATED;
+    sync_thread_cleanup(threads[current_thread].info.tid);
+    refresh_process_state(threads[current_thread].process_slot);
+    process_yield();
+    cpu_halt();
+}
+_Noreturn void process_exit_with_status(int32_t status)
+{
+    interrupts_disable();
+    size_t slot = threads[current_thread].process_slot;
+    if (slot == 0u) cpu_halt();
+    terminate_process(slot, status);
+    process_yield();
+    cpu_halt();
+}
+_Noreturn void process_exit(void) { process_exit_with_status(0); }
+bool process_kill(uint32_t pid)
+{
+    uint32_t flags = interrupts_save();
+    size_t slot = find_process(pid);
+    if (pid == 0u || slot == PROCESS_MAX || threads[current_thread].process_slot != 0u) {
+        interrupts_restore(flags);
+        return false;
+    }
+    terminate_process(slot, PROCESS_EXIT_KILLED);
+    reap_spaces();
     interrupts_restore(flags);
     return true;
 }
@@ -371,7 +403,7 @@ uint32_t process_cpu_ticks(void)
 bool thread_block_current(void)
 {
     uint32_t flags = interrupts_save();
-    if (ready_count == 0u || threads[current_thread].info.state != THREAD_RUNNING) {
+    if (current_thread == IDLE_SLOT || threads[current_thread].info.state != THREAD_RUNNING) {
         interrupts_restore(flags);
         return false;
     }
@@ -387,6 +419,7 @@ bool thread_unblock(uint32_t tid)
 {
     uint32_t flags = interrupts_save();
     for (size_t i = 0u; i < THREAD_MAX; ++i) {
+        if (i == IDLE_SLOT) continue;
         if (threads[i].info.tid == tid &&
             threads[i].info.state == THREAD_BLOCKED) {
             threads[i].info.state = THREAD_READY;
@@ -398,4 +431,31 @@ bool thread_unblock(uint32_t tid)
     }
     interrupts_restore(flags);
     return false;
+}
+
+uint32_t process_ticks(void) { return scheduler_ticks; }
+bool process_find_info(uint32_t pid, process_info_t *info)
+{
+    if (info == NULL) return false;
+    uint32_t flags = interrupts_save();
+    for (size_t i = 0; i < PROCESS_MAX; ++i) {
+        if (processes[i].info.state != PROCESS_UNUSED && processes[i].info.pid == pid) {
+            *info = processes[i].info;
+            interrupts_restore(flags);
+            return true;
+        }
+    }
+    interrupts_restore(flags);
+    return false;
+}
+void thread_sleep(uint32_t ticks)
+{
+    if (ticks == 0u) { process_yield(); return; }
+    if (ticks > INT32_MAX || current_thread == IDLE_SLOT) return;
+    uint32_t flags = interrupts_save();
+    threads[current_thread].wake_tick = scheduler_ticks + ticks;
+    threads[current_thread].info.state = THREAD_SLEEPING;
+    refresh_process_state(threads[current_thread].process_slot);
+    process_yield();
+    interrupts_restore(flags);
 }

@@ -1,13 +1,42 @@
 #include <alpacos/drivers.h>
 #include <alpacos/io.h>
+#include <alpacos/interrupts.h>
 #include <stdbool.h>
 
 #define COM1 0x3F8u
-static bool available;
+static bool available, irq_enabled;
+static unsigned char input_buffer[256];
+static unsigned input_head, input_tail;
+static input_stats_t stats;
+static void serial_interrupt(void)
+{
+    for (unsigned n = 0; n < sizeof(input_buffer) && (inb(COM1 + 5u) & 1u) != 0u; ++n) {
+        unsigned char c = inb(COM1);
+        ++stats.received;
+        unsigned next = (input_head + 1u) % sizeof(input_buffer);
+        if (next == input_tail) ++stats.dropped;
+        else { input_buffer[input_head] = c; input_head = next; }
+    }
+}
+void serial_enable_interrupts(void)
+{
+    if (!available) return;
+    uint32_t flags = interrupts_save();
+    irq_register_handler(4u, serial_interrupt);
+    irq_enabled = true;
+    outb(COM1 + 1u, 1u);
+    interrupts_restore(flags);
+}
+void serial_get_stats(input_stats_t *out)
+{
+    uint32_t flags = interrupts_save();
+    if (out != 0) *out = stats;
+    interrupts_restore(flags);
+}
 
 void serial_init(void)
 {
-    outb(COM1 + 1u, 0x00);  /* COM1 sigue por sondeo; no se utiliza IRQ4. */
+    outb(COM1 + 1u, 0x00);  /* IRQ4 se habilita despues de instalar IDT/PIC. */
     outb(COM1 + 3u, 0x80);  /* DLAB, divisor = 1 -> 115200 baud. */
     outb(COM1, 0x01);
     outb(COM1 + 1u, 0x00);
@@ -36,8 +65,15 @@ void serial_putc(char c)
 
 int serial_read(void)
 {
-    if (!available || (inb(COM1 + 5u) & 1u) == 0u) {
-        return -1;
-    }
-    return inb(COM1);
+    if (!available) return -1;
+    uint32_t flags = interrupts_save();
+    int c = -1;
+    if (irq_enabled) {
+        if (input_tail != input_head) {
+            c = input_buffer[input_tail];
+            input_tail = (input_tail + 1u) % sizeof(input_buffer);
+        }
+    } else if ((inb(COM1 + 5u) & 1u) != 0u) c = inb(COM1);
+    interrupts_restore(flags);
+    return c;
 }

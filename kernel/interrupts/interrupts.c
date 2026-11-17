@@ -92,6 +92,17 @@ static const char *const exception_names[32] = {
 
 static _Noreturn void exception_panic(const interrupt_frame_t *frame)
 {
+    if (frame->vector == 14u && process_current_pid() != 0u) {
+        uint32_t address;
+        __asm__ volatile ("movl %%cr2, %0" : "=r"(address));
+        console_write("\n[PAGE FAULT] PID ");
+        console_uint(process_current_pid());
+        console_write(" direccion="); console_hex(address);
+        console_write(" error="); console_hex(frame->error);
+        console_writeln(". Proceso finalizado; el shell sigue activo.");
+        process_exit_with_status(PROCESS_EXIT_PAGE_FAULT);
+    }
+
     console_set_color(0x0C);
     console_write("\nPANIC: ");
     console_write(frame->vector < 32u ? exception_names[frame->vector]

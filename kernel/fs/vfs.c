@@ -1,5 +1,12 @@
 #include <alpacos/kstring.h>
 #include <alpacos/vfs.h>
+#include <stdint.h>
+#ifndef ALPACOS_HOST_TEST
+#include <alpacos/interrupts.h>
+#else
+static uint32_t interrupts_save(void) { return 0; }
+static void interrupts_restore(uint32_t flags) { (void)flags; }
+#endif
 
 /* Cada entrada ocupa un espacio fijo. El indice 0 es la raiz "/". */
 typedef struct {
@@ -94,7 +101,7 @@ static vfs_result_t resolve(const char *path, bool parent_only,
     }
 }
 
-void vfs_init(void)
+static void locked_init(void)
 {
     memset(nodes, 0, sizeof(nodes));
     nodes[0].used = true;
@@ -122,17 +129,17 @@ static vfs_result_t create(const char *path, bool directory)
     return VFS_ERR_FULL;
 }
 
-vfs_result_t vfs_mkdir(const char *path)
+static vfs_result_t locked_mkdir(const char *path)
 {
     return create(path, true);
 }
 
-vfs_result_t vfs_touch(const char *path)
+static vfs_result_t locked_touch(const char *path)
 {
     return create(path, false);
 }
 
-vfs_result_t vfs_write(const char *path, const char *text)
+static vfs_result_t locked_write(const char *path, const char *text)
 {
     size_t index;
     if (text == NULL) return VFS_ERR_INVALID_PATH;
@@ -148,7 +155,7 @@ vfs_result_t vfs_write(const char *path, const char *text)
     return VFS_OK;
 }
 
-vfs_result_t vfs_read(const char *path, const char **text, size_t *size)
+static vfs_result_t locked_read(const char *path, const char **text, size_t *size)
 {
     size_t index;
     if (text == NULL || size == NULL) return VFS_ERR_INVALID_PATH;
@@ -160,7 +167,7 @@ vfs_result_t vfs_read(const char *path, const char **text, size_t *size)
     return VFS_OK;
 }
 
-vfs_result_t vfs_list(const char *path, vfs_list_callback_t callback, void *context)
+static vfs_result_t locked_list(const char *path, vfs_list_callback_t callback, void *context)
 {
     size_t parent;
     if (callback == NULL) return VFS_ERR_INVALID_PATH;
@@ -192,12 +199,12 @@ static vfs_result_t remove_node(const char *path, bool directory)
     return VFS_OK;
 }
 
-vfs_result_t vfs_unlink(const char *path)
+static vfs_result_t locked_unlink(const char *path)
 {
     return remove_node(path, false);
 }
 
-vfs_result_t vfs_rmdir(const char *path)
+static vfs_result_t locked_rmdir(const char *path)
 {
     return remove_node(path, true);
 }
@@ -217,4 +224,46 @@ const char *vfs_result_message(vfs_result_t result)
         case VFS_ERR_ROOT: return "No se puede modificar la raiz /.";
     }
     return "Error VFS desconocido.";
+}
+
+void vfs_init(void) { uint32_t flags = interrupts_save(); locked_init(); interrupts_restore(flags); }
+#define VFS_SINGLE(name) \
+    vfs_result_t vfs_##name(const char *path) { \
+        uint32_t flags = interrupts_save(); \
+        vfs_result_t result = locked_##name(path); \
+        interrupts_restore(flags); return result; \
+    }
+VFS_SINGLE(mkdir)
+VFS_SINGLE(touch)
+VFS_SINGLE(unlink)
+VFS_SINGLE(rmdir)
+vfs_result_t vfs_write(const char *path, const char *text)
+{
+    uint32_t flags = interrupts_save();
+    vfs_result_t result = locked_write(path, text);
+    interrupts_restore(flags); return result;
+}
+vfs_result_t vfs_read(const char *path, const char **text, size_t *size)
+{
+    uint32_t flags = interrupts_save();
+    vfs_result_t result = locked_read(path, text, size);
+    interrupts_restore(flags); return result;
+}
+vfs_result_t vfs_read_copy(const char *path, char *buffer, size_t capacity, size_t *size)
+{
+    if (buffer == NULL || size == NULL) return VFS_ERR_INVALID_PATH;
+    uint32_t flags = interrupts_save();
+    const char *text; size_t length;
+    vfs_result_t result = locked_read(path, &text, &length);
+    if (result == VFS_OK) {
+        if (length >= capacity) result = VFS_ERR_TOO_LARGE;
+        else { memcpy(buffer, text, length + 1u); *size = length; }
+    }
+    interrupts_restore(flags); return result;
+}
+vfs_result_t vfs_list(const char *path, vfs_list_callback_t callback, void *context)
+{
+    uint32_t flags = interrupts_save();
+    vfs_result_t result = locked_list(path, callback, context);
+    interrupts_restore(flags); return result;
 }

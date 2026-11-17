@@ -30,7 +30,10 @@ void vfs_init(void);
 vfs_result_t vfs_mkdir(const char *path);
 vfs_result_t vfs_touch(const char *path);
 vfs_result_t vfs_write(const char *path, const char *text);
+/* Lectura prestada: el puntero vale hasta la siguiente modificacion del VFS. */
 vfs_result_t vfs_read(const char *path, const char **text, size_t *size);
+vfs_result_t vfs_read_copy(const char *path, char *buffer, size_t capacity, size_t *size);
+/* El callback de listado no debe bloquear ni modificar el VFS. */
 vfs_result_t vfs_list(const char *path, vfs_list_callback_t callback, void *context);
 vfs_result_t vfs_unlink(const char *path);
 vfs_result_t vfs_rmdir(const char *path);

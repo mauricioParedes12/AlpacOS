@@ -16,7 +16,10 @@ void deadlock_wait_end(uint32_t tid);
 /* Solo la demostracion mantiene el ciclo hasta que el shell elija una victima.
  * En otros casos, mutex_lock devuelve false para impedir el deadlock.
  */
-void deadlock_wait_cycle(uint32_t tid);
+bool deadlock_wait_cycle(uint32_t tid);
+bool deadlock_has_cycle(void);
+uint32_t deadlock_demo_start(void);
+bool deadlock_resolve(void);
 
 /* Muestra el estado del grafo y ejecuta la demostracion desde el shell. */
 void deadlock_command(size_t argc, char **argv);

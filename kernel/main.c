@@ -28,13 +28,13 @@ _Noreturn void kernel_main(uint32_t magic, const multiboot_info_prefix_t *info)
         cpu_halt();
     }
     const boot_info_t *boot = bootinfo_get();
-    if (!boot->memory_available ||
-        !memory_init(boot->lower_kib, boot->upper_kib, boot->kernel_end)) {
+    interrupts_init();
+    if (!memory_init(boot)) {
         console_set_color(0x0C);
         console_writeln("PANIC: no se pudo inicializar el gestor de memoria/paginacion.");
         cpu_halt();
     }
-    interrupts_init();
+    serial_enable_interrupts();
     timer_init();
     bool keyboard_ready = keyboard_init();
     vfs_init();
@@ -47,10 +47,10 @@ _Noreturn void kernel_main(uint32_t magic, const multiboot_info_prefix_t *info)
     console_writeln("[OK] Consola VGA y puerto serie.");
     console_writeln("[OK] Sistema de archivos virtual en RAM (no persistente).");
     console_writeln("[OK] Procesos y Round Robin por hilos: quantum de 10 ticks (~100 ms).");
-    console_writeln("[OK] Hilos del kernel y mutex con bloqueo/despertar.");
-    console_writeln("[OK] Marcos fisicos de 4 KiB y paginacion x86 activa (64 MiB identidad).");
+    console_writeln("[OK] Hilos, idle, sleep, mutex y semaforos con colas de espera.");
+    console_writeln("[OK] Marcos de 4 KiB, mapa de RAM y paginacion x86 activa.");
     console_writeln("[OK] Deteccion y recuperacion de deadlocks.");
-    console_writeln("[PENDIENTE] Espacios virtuales independientes.");
+    console_writeln("[OK] Directorio de paginas propio por proceso (ejecucion en ring 0).");
     console_writeln("Escribe help para ver los comandos.\n");
     interrupts_enable();
     shell_run();

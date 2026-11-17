@@ -1,6 +1,7 @@
 #include <alpacos/bootinfo.h>
 #include <alpacos/console.h>
 #include <alpacos/deadlock.h>
+#include <alpacos/drivers.h>
 #include <alpacos/interrupts.h>
 #include <alpacos/io.h>
 #include <alpacos/kstring.h>
@@ -21,6 +22,9 @@ typedef struct {
     command_handler_t handler;
 } command_t;
 
+static void cmd_procmap(size_t argc, char **argv);
+static void cmd_ioinfo(size_t argc, char **argv);
+static void cmd_faultdemo(size_t argc, char **argv);
 static void cmd_help(size_t argc, char **argv);
 static void cmd_clear(size_t argc, char **argv);
 static void cmd_echo(size_t argc, char **argv);
@@ -46,6 +50,9 @@ static void cmd_kill(size_t argc, char **argv);
 static bool require_args(size_t argc, size_t expected, const char *usage);
 
 static const command_t commands[] = {
+    {"procmap", "Muestra CR3 y pagina privada: procmap PID", cmd_procmap},
+    {"ioinfo", "Contadores de entrada PS/2 y COM1 por IRQ", cmd_ioinfo},
+    {"faultdemo", "Crea un proceso que provoca un fallo de pagina", cmd_faultdemo},
     {"help", "Lista los comandos disponibles", cmd_help},
     {"clear", "Limpia la consola", cmd_clear},
     {"echo", "Muestra los argumentos separados por espacios", cmd_echo},
@@ -60,7 +67,7 @@ static const command_t commands[] = {
     {"threads", "Lista hilos, estados, turnos y contador compartido", cmd_threads},
     {"spawn", "Crea un proceso con su primer hilo: spawn nombre", cmd_spawn},
     {"thread", "Agrega un hilo a un proceso: thread PID nombre", cmd_thread},
-    {"kill", "Solicita la finalizacion ordenada de un proceso", cmd_kill},
+    {"kill", "Finaliza todos los hilos y libera recursos: kill PID", cmd_kill},
     {"ls", "Lista archivos y directorios: ls [/ruta]", cmd_ls},
     {"mkdir", "Crea directorio: mkdir /ruta", cmd_mkdir},
     {"touch", "Crea archivo vacio: touch /ruta", cmd_touch},
@@ -139,6 +146,7 @@ static void cmd_meminfo(size_t argc, char **argv)
     } else {
         console_writeln("El cargador no proporciono memoria basica.");
     }
+    console_writeln(stats.uses_memory_map ? "Mapa fisico: E820/Multiboot" : "Mapa fisico: memoria basica Multiboot");
     console_write("Marcos de 4 KiB: total=");
     console_uint(stats.total_frames);
     console_write(" usados=");
@@ -150,7 +158,7 @@ static void cmd_meminfo(size_t argc, char **argv)
     console_uint(stats.reserved_frames);
     console_writeln(" marcos");
     console_write("Paginacion: ");
-    console_writeln(stats.paging_enabled ? "ACTIVA (mapeo identidad de 64 MiB)" : "INACTIVA");
+    console_writeln(stats.paging_enabled ? "ACTIVA (kernel compartido y directorio propio por proceso)" : "INACTIVA");
     console_write("Kernel: ");
     console_hex((uint32_t)info->kernel_start);
     console_write(" - ");
@@ -250,15 +258,15 @@ static void cmd_modules(size_t argc, char **argv)
     (void)argv;
     if (!no_args(argc)) return;
     console_writeln("[BASE] Boot Multiboot + kernel + GDT + stack");
-    console_writeln("[BASE] Shell, VGA y COM1 por sondeo");
+    console_writeln("[BASE] Shell y VGA; entrada COM1 por IRQ4");
     console_writeln("[BASE] IDT, excepciones y PIC con IRQ 0..15");
     console_writeln("[BASE] PIT a unos 100 Hz y teclado PS/2 US por IRQ");
     console_writeln("[OK] Procesos, PCB y contexto completo por interrupciones");
     console_writeln("[OK] Round Robin preventivo: 10 ticks por turno (~100 ms)");
     console_writeln("[OK] Hilos del kernel y Round Robin por TID");
-    console_writeln("[OK] Mutex con bloqueo y despertar de hilos");
+    console_writeln("[OK] Mutex, semaforos, sleep e idle; limpieza al finalizar");
     console_writeln("[OK] Allocator de marcos de 4 KiB y paginacion x86 activa");
-    console_writeln("[OK] Mapeo identidad de 64 MiB y paginas virtuales de prueba");
+    console_writeln("[OK] CR3 por proceso y pagina privada en 0x40000000");
     console_writeln("[OK] VFS en RAM: directorios y archivos (sin persistencia)");
     console_writeln("[OK] Deteccion de ciclos y recuperacion de deadlocks con mutex");
 }
@@ -276,7 +284,6 @@ static bool require_args(size_t argc, size_t expected, const char *usage)
 typedef struct {
     uint32_t pid;
     volatile uint32_t counter;
-    volatile bool stop_requested;
     mutex_t mutex;
 } demo_context_t;
 
@@ -317,19 +324,13 @@ static void demo_thread(void)
     demo_context_t *context = demo_context_for_pid(process_current_pid());
     if (context == NULL) return;
 
+    volatile uint32_t *counter = (volatile uint32_t *)MEMORY_PROCESS_BASE;
     for (;;) {
         if (!mutex_lock(&context->mutex)) return;
-        if (context->stop_requested) {
-            (void)mutex_unlock(&context->mutex);
-            return;
-        }
-
-        ++context->counter;
-        /* Cede la CPU con el mutex tomado para que otro hilo tenga que esperar. */
+        ++*counter;
+        context->counter = *counter;
         process_yield();
-        bool stop = context->stop_requested;
         if (!mutex_unlock(&context->mutex)) return;
-        if (stop) return;
     }
 }
 
@@ -378,6 +379,7 @@ static void cmd_threads(size_t argc, char **argv)
         switch (info.state) {
             case THREAD_READY: console_write("READY        "); break;
             case THREAD_RUNNING: console_write("RUNNING      "); break;
+            case THREAD_SLEEPING: console_write("SLEEPING     "); break;
             case THREAD_BLOCKED: console_write("BLOCKED      "); break;
             case THREAD_TERMINATED: console_write("TERMINATED   "); break;
             default: console_write("UNUSED       "); break;
@@ -413,7 +415,6 @@ static void cmd_spawn(size_t argc, char **argv)
     if (pid != 0u) {
         context->pid = pid;
         context->counter = 0u;
-        context->stop_requested = false;
         mutex_init(&context->mutex);
     }
     interrupts_restore(flags);
@@ -449,7 +450,7 @@ static void cmd_thread(size_t argc, char **argv)
         return;
     }
     demo_context_t *context = demo_context_for_pid(pid);
-    if (context == NULL || context->stop_requested) {
+    if (context == NULL) {
         console_writeln("Error: el proceso no existe o ya esta finalizando.");
         return;
     }
@@ -474,26 +475,8 @@ static void cmd_kill(size_t argc, char **argv)
         return;
     }
 
-    demo_context_t *context = demo_context_for_pid(pid);
-    if (context != NULL) {
-        bool active = false;
-        for (size_t i = 1u; i < PROCESS_MAX; ++i) {
-            process_info_t info;
-            if (process_get_info(i, &info) && info.pid == pid &&
-                info.state != PROCESS_TERMINATED && info.state != PROCESS_UNUSED) {
-                active = true;
-                break;
-            }
-        }
-        if (active) {
-            context->stop_requested = true;
-            console_writeln("Solicitud enviada; los hilos terminaran al liberar el mutex.");
-            return;
-        }
-    }
-
     if (!process_kill(pid)) {
-        console_writeln("Error: proceso inexistente o con hilos bloqueados.");
+        console_writeln("Error: proceso inexistente o protegido (PID 0).");
         return;
     }
     console_writeln("Proceso terminado.");
@@ -574,9 +557,9 @@ static void cmd_write(size_t argc, char **argv)
 static void cmd_cat(size_t argc, char **argv)
 {
     if (!require_args(argc, 2u, "cat /ruta")) return;
-    const char *content;
+    char content[VFS_FILE_CAPACITY];
     size_t size;
-    vfs_result_t result = vfs_read(argv[1], &content, &size);
+    vfs_result_t result = vfs_read_copy(argv[1], content, sizeof(content), &size);
     if (result == VFS_OK) {
         (void)size;
         console_writeln(content);
@@ -644,8 +627,8 @@ _Noreturn void shell_run(void)
         interrupts_disable();
         int input = console_read();
         if (input < 0) {
-            /* STI + HLT evita perder una IRQ entre comprobar y dormir. */
-            interrupts_wait();
+            interrupts_enable();
+            thread_sleep(1u);
             continue;
         }
         interrupts_enable();
@@ -699,4 +682,41 @@ _Noreturn void shell_run(void)
             }
         }
     }
+}
+
+static void cmd_procmap(size_t argc, char **argv)
+{
+    if (!require_args(argc, 2u, "procmap PID")) return;
+    uint32_t pid; process_info_t info;
+    if (!parse_pid(argv[1], &pid) || !process_find_info(pid, &info) || info.state == PROCESS_TERMINATED) {
+        console_writeln("Error: proceso no activo."); return;
+    }
+    console_write("PID "); console_uint(pid);
+    console_write(" CR3="); console_hex(info.address_space);
+    if (pid != 0u) {
+        console_write(" | virtual="); console_hex(MEMORY_PROCESS_BASE);
+        console_write(" -> fisica="); console_hex(info.private_frame);
+        console_write(" | dato="); console_uint(*(volatile uint32_t *)info.private_frame);
+    }
+    console_writeln(" | ring 0");
+}
+static void cmd_ioinfo(size_t argc, char **argv)
+{
+    (void)argv;
+    if (!no_args(argc)) return;
+    input_stats_t serial, keyboard;
+    serial_get_stats(&serial); keyboard_get_stats(&keyboard);
+    console_write("COM1 IRQ4: recibidos="); console_uint(serial.received);
+    console_write(" descartados="); console_uint(serial.dropped);
+    console_write("\nPS/2 IRQ1: recibidos="); console_uint(keyboard.received);
+    console_write(" descartados="); console_uint(keyboard.dropped);
+    console_putc('\n');
+}
+static void fault_worker(void) { *(volatile uint32_t *)0x80000000u = 1u; }
+static void cmd_faultdemo(size_t argc, char **argv)
+{
+    (void)argv;
+    if (!no_args(argc)) return;
+    uint32_t pid = process_spawn("fallo-pagina", fault_worker);
+    console_write("Proceso de prueba de fallo: PID "); console_uint(pid); console_putc('\n');
 }

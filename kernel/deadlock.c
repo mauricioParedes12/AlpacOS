@@ -25,7 +25,6 @@ static volatile bool b_holds_first;
 static uint32_t demo_pid;
 static uint32_t demo_tid_a;
 static uint32_t demo_tid_b;
-static uint32_t pending_victim;
 static uint32_t completed_workers;
 static uint32_t abandoned_workers;
 
@@ -37,28 +36,38 @@ static wait_entry_t *find_wait(uint32_t tid)
     return NULL;
 }
 
+/* Solo seguir desde start: un ciclo ajeno no invalida esta solicitud. */
+static bool cycle_from(uint32_t start, uint32_t *last)
+{
+    uint32_t current = start;
+    for (size_t hop = 0; hop < THREAD_MAX; ++hop) {
+        wait_entry_t *edge = find_wait(current);
+        if (edge == NULL || edge->mutex->owner_tid == MUTEX_NO_OWNER) return false;
+        if (edge->mutex->owner_tid == start) {
+            if (last != NULL) *last = current;
+            return true;
+        }
+        current = edge->mutex->owner_tid;
+    }
+    return false;
+}
 static bool detect_cycle(uint32_t *first, uint32_t *second)
 {
-    for (size_t i = 0u; i < THREAD_MAX; ++i) {
-        if (!waiting[i].active) continue;
-        uint32_t start = waiting[i].tid;
-        uint32_t current = start;
-        for (size_t hop = 0u; hop < THREAD_MAX; ++hop) {
-            wait_entry_t *edge = find_wait(current);
-            if (edge == NULL) break;
-            uint32_t owner = edge->mutex->owner_tid;
-            if (owner == MUTEX_NO_OWNER) break;
-            if (owner == start) {
-                if (first != NULL) *first = start;
-                if (second != NULL) *second = edge->tid;
-                return true;
-            }
-            current = owner;
+    for (size_t i = 0; i < THREAD_MAX; ++i) {
+        if (waiting[i].active && cycle_from(waiting[i].tid, second)) {
+            if (first != NULL) *first = waiting[i].tid;
+            return true;
         }
     }
     return false;
 }
-
+bool deadlock_has_cycle(void)
+{
+    uint32_t flags = interrupts_save();
+    bool result = detect_cycle(NULL, NULL);
+    interrupts_restore(flags);
+    return result;
+}
 bool deadlock_wait_begin(uint32_t tid, const mutex_t *mutex)
 {
     if (mutex == NULL) return true;
@@ -76,7 +85,7 @@ bool deadlock_wait_begin(uint32_t tid, const mutex_t *mutex)
     entry->tid = tid;
     entry->mutex = mutex;
     entry->active = true;
-    bool cycle = detect_cycle(NULL, NULL);
+    bool cycle = cycle_from(tid, NULL);
     if (cycle) {
         ++detected_count;
     }
@@ -92,24 +101,13 @@ void deadlock_wait_end(uint32_t tid)
     interrupts_restore(flags);
 }
 
-void deadlock_wait_cycle(uint32_t tid)
+bool deadlock_wait_cycle(uint32_t tid)
 {
     uint32_t flags = interrupts_save();
-    bool demo_thread = demo_pid != 0u &&
-        (tid == demo_tid_a || tid == demo_tid_b);
-    if (demo_thread && pending_victim == 0u) {
-        pending_victim = tid;
-        /* El segundo hilo permanece BLOCKED hasta 'deadlock resolve'.
-         * No se encola en el mutex: al reactivarse, mutex_lock fallara
-         * y el trabajador liberara el primer recurso. */
-        if (!thread_block_current()) {
-            pending_victim = 0u;
-            ++prevented_count;
-        }
-    } else {
-        ++prevented_count; /* En el resto del sistema se evita el ciclo. */
-    }
+    bool keep_cycle = demo_pid != 0u && (tid == demo_tid_a || tid == demo_tid_b);
+    if (!keep_cycle) ++prevented_count;
     interrupts_restore(flags);
+    return keep_cycle;
 }
 
 static void worker_a(void)
@@ -160,15 +158,15 @@ static uint32_t find_initial_thread(uint32_t pid)
     return 0u;
 }
 
-static void run_demo(void)
+uint32_t deadlock_demo_start(void)
 {
     uint32_t flags = interrupts_save();
     if (demo_pid != 0u && demo_is_active()) {
         interrupts_restore(flags);
         console_writeln("Ya hay una demostracion activa. Usa deadlock check.");
-        return;
+        return 0u;
     }
-    demo_pid = demo_tid_a = demo_tid_b = pending_victim = 0u;
+    demo_pid = demo_tid_a = demo_tid_b = 0u;
     a_holds_first = b_holds_first = false;
     completed_workers = abandoned_workers = 0u;
     mutex_init(&resource_a);
@@ -181,7 +179,7 @@ static void run_demo(void)
         if (pid != 0u) (void)process_kill(pid);
         interrupts_restore(flags);
         console_writeln("No se pudo crear la demo (sin plazas libres).");
-        return;
+        return 0u;
     }
     demo_pid = pid;
     demo_tid_a = tid_a;
@@ -194,6 +192,7 @@ static void run_demo(void)
     console_write(" y ");
     console_uint(tid_b);
     console_writeln(". Ejecuta deadlock check para ver el ciclo.");
+    return pid;
 }
 
 static void check_demo(void)
@@ -238,27 +237,14 @@ static void check_demo(void)
     interrupts_restore(flags);
 }
 
-static void resolve_demo(void)
+bool deadlock_resolve(void)
 {
-    uint32_t flags = interrupts_save();
-    if (pending_victim == 0u) {
-        interrupts_restore(flags);
-        console_writeln("No hay un deadlock pendiente de resolucion.");
-        return;
-    }
-    uint32_t tid = pending_victim;
-    if (!thread_unblock(tid)) {
-        interrupts_restore(flags);
-        console_writeln("No se pudo despertar al hilo victima.");
-        return;
-    }
-    pending_victim = 0u;
-    deadlock_wait_end(tid);
-    ++recovered_count;
+    uint32_t flags = interrupts_save(), victim = 0u;
+    bool found = detect_cycle(&victim, NULL);
+    bool result = found && mutex_cancel_wait(victim);
+    if (result) ++recovered_count;
     interrupts_restore(flags);
-    console_write("Recuperacion solicitada: TID ");
-    console_uint(tid);
-    console_writeln(" abandonara el segundo mutex y soltara el primero.");
+    return result;
 }
 
 void deadlock_command(size_t argc, char **argv)
@@ -266,11 +252,11 @@ void deadlock_command(size_t argc, char **argv)
     if (argc != 2u) {
         console_writeln("Uso: deadlock demo | check | resolve");
     } else if (kstreq(argv[1], "demo")) {
-        run_demo();
+        (void)deadlock_demo_start();
     } else if (kstreq(argv[1], "check")) {
         check_demo();
     } else if (kstreq(argv[1], "resolve")) {
-        resolve_demo();
+        console_writeln(deadlock_resolve() ? "Espera cancelada: el hilo liberara sus recursos al reanudarse." : "No hay un ciclo recuperable.");
     } else {
         console_writeln("Uso: deadlock demo | check | resolve");
     }
