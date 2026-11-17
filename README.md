@@ -4,7 +4,7 @@ AlpacOS es el mini sistema operativo que estamos desarrollando para el curso de 
 
 Está escrito en C11 y Assembly (GNU as), para x86 de 32 bits. Lo ejecutamos en QEMU y se puede compilar desde Linux o desde Windows con Ubuntu en WSL2.
 
-## Avance actual: v0.6.0
+## Avance actual: v0.7.0
 
 El sistema ya arranca con Multiboot y tiene una consola con comandos propios. Cuenta con salida VGA y por puerto serie, teclado PS/2 por interrupciones, un temporizador PIT y un sistema de archivos en RAM. El arranque configura la GDT y la pila; el kernel instala la IDT y el PIC para atender excepciones e interrupciones.
 
@@ -12,7 +12,9 @@ En esta versión agregamos hilos del kernel y sincronización. Un proceso puede 
 
 También incorporamos mutex. Cuando un hilo intenta tomar uno que ya está ocupado, queda en estado `BLOCKED`; al liberarlo, se despierta al siguiente hilo que estaba esperando. El shell incluye comandos para crear hilos y revisar sus estados.
 
-Siguen pendientes la gestión de memoria con paginación y el manejo de deadlocks.
+En esta versión agregamos un gestor sencillo de marcos físicos de 4 KiB y activamos la paginación de x86. El kernel mantiene un mapeo identidad de los primeros 64 MiB y puede reservar marcos, mapearlos en direcciones virtuales de prueba y liberarlos. `meminfo` muestra ahora los marcos totales, usados y libres; `pagealloc` y `pagefree` permiten comprobar la reserva y liberación desde el shell.
+
+El mapa de memoria es compartido por todo el kernel. Los procesos e hilos todavía no tienen directorios de páginas propios ni aislamiento entre sí. Tampoco hay memoria virtual bajo demanda, swapping ni detección de deadlocks.
 
 ## Compilar y ejecutar
 
@@ -44,13 +46,15 @@ El teclado está configurado con la distribución estadounidense (US).
 | `echo hola` | Escribe el texto indicado. |
 | `version` | Muestra la versión y la arquitectura. |
 | `uptime` | Indica cuántos segundos lleva encendido el sistema. |
-| `meminfo` | Muestra la memoria reportada al arrancar y el espacio reservado para el kernel. No calcula la RAM libre. |
+| `meminfo` | Muestra la RAM reportada, los marcos físicos usados/libres y si la paginación está activa. |
+| `pagealloc` | Reserva un marco físico y lo mapea en una dirección virtual de prueba. |
+| `pagefree 0xD0000000` | Desmapea y libera una página reservada; usa la dirección que mostró `pagealloc`. |
 | `modules` | Muestra qué partes están implementadas y cuáles faltan. |
 | `ps` | Lista los procesos, cuántos hilos tienen y sus contadores de CPU. |
 | `threads` | Muestra TID, PID, estado, ticks y turnos de cada hilo, además del contador compartido de la prueba. |
 | `spawn nombre` | Crea un proceso de prueba con su primer hilo. |
 | `thread PID nombre` | Agrega otro hilo al proceso indicado. |
-| `kill PID` | Termina los hilos listos de un proceso, siempre que no tenga hilos bloqueados. |
+| `kill PID` | Solicita que terminen los hilos de demostración del proceso. |
 | `ls [/ruta]` | Lista el contenido de un directorio. Sin ruta, muestra `/`. |
 | `mkdir /ruta` | Crea un directorio dentro de otro que ya exista. |
 | `touch /ruta` | Crea un archivo vacío. |
@@ -85,6 +89,26 @@ Usamos rutas absolutas, como `/docs/nota.txt`. Los nombres pueden llevar letras,
 
 Este sistema de archivos todavía no tiene permisos, usuarios, montajes ni almacenamiento en disco.
 
+## Memoria y paginación
+
+El gestor toma la cantidad de memoria básica reportada por Multiboot y administra marcos físicos de 4 KiB. Para evitar pisar el kernel, la pila, las tablas iniciales y los datos de arranque, reserva los primeros 4 MiB (o más si el kernel termina después de esa dirección). Por ahora trabaja con un máximo de 64 MiB.
+
+Al iniciar, AlpacOS crea un directorio de páginas y tablas que mapean de forma identidad los primeros 64 MiB: una dirección virtual apunta al mismo número físico. Después activa el bit de paginación del registro `CR0`. Las tablas necesarias para direcciones virtuales adicionales se crean cuando se mapea una página y se liberan cuando quedan vacías.
+
+Para probarlo desde el shell:
+
+```text
+meminfo
+pagealloc
+meminfo
+pagefree 0xD0000000
+meminfo
+```
+
+`pagealloc` muestra la dirección virtual y el marco físico asignado. También escribe y lee un valor de prueba en esa página. La dirección de ejemplo `0xD0000000` es la primera del área de prueba; usa exactamente la dirección que te devuelva el comando. `pagefree` quita el mapeo y devuelve el marco al allocator.
+
+Este avance usa un único directorio de páginas compartido por el kernel, procesos e hilos. El mapeo identidad permite seguir ejecutando el código y las pilas actuales después de activar paginación, pero no proporciona aislamiento entre procesos. El allocator se basa en los campos de memoria básica de Multiboot y limita su administración a los primeros 64 MiB; todavía no interpreta el mapa E820 completo, no implementa espacios de direcciones independientes ni memoria virtual bajo demanda.
+
 ## Procesos, hilos y Round Robin
 
 Cada proceso tiene un PCB con PID, nombre, estado, contadores y cantidad de hilos. El shell sigue siendo el proceso con PID 0. Se pueden tener hasta siete procesos de prueba activos.
@@ -97,21 +121,19 @@ El módulo de sincronización incluye un mutex no recursivo. Si un hilo intenta 
 
 ### Probar procesos, hilos y mutex
 
-Arranca AlpacOS y ejecuta estos comandos:
+Arranca AlpacOS y ejecuta los comandos usando el PID que muestre `spawn` (no siempre será 1):
 
 ```text
 spawn grupo
-thread 1 hiloB
-thread 1 hiloC
+thread 4 hiloB
+thread 4 hiloC
 ps
 threads
 ```
 
-`spawn` crea el proceso `grupo` con un hilo inicial. Los otros dos comandos agregan hilos al mismo PID. Los tres ejecutan una tarea de prueba que incrementa un contador compartido 200 veces. Cada hilo cede una vez la CPU mientras tiene tomado el mutex para que otro pueda intentar entrar y quedar bloqueado. Después mantiene el proceso ocupado unos cinco segundos de CPU para que puedas agregar los hilos desde el shell.
+En este ejemplo, `4` representa el PID devuelto por `spawn`; reemplázalo por el tuyo. El proceso empieza con un hilo y `thread` agrega los demás. Los hilos incrementan continuamente un contador compartido protegido por un mutex. Para que se pueda observar la sincronización, cada hilo cede la CPU mientras mantiene tomado el mutex. Cuando otro hilo intenta entrar, queda en estado `BLOCKED` hasta que el propietario libera el recurso.
 
-En `threads` puedes revisar los estados `READY`, `RUNNING`, `BLOCKED` y `TERMINATED`. El contador del proceso debe llegar a 600 cuando hayan terminado los tres hilos. Si ejecutas el comando antes de que acaben, vuelve a consultarlo para ver el avance. `ps` muestra el estado general del proceso y el total de hilos que siguen activos.
-
-`kill PID` puede terminar los hilos que estén listos, pero no mata un proceso si alguno de sus hilos está bloqueado esperando un mutex. Esta restricción evita dejar referencias a TID que ya no existen en la cola de espera.
+El proceso de prueba permanece activo hasta que ejecutes `kill PID`. Ese comando solicita el cierre: cada hilo termina después de salir de su sección crítica y liberar el mutex. Mientras tanto, `ps` muestra el estado del proceso y `threads` permite revisar los TID, los estados y el contador compartido. El valor del contador sigue aumentando mientras los hilos están activos; no hay un resultado fijo como 600.
 
 Los procesos y sus hilos siguen ejecutándose en ring 0 y comparten el espacio de memoria del kernel. El ejemplo usa un contador global asociado al PID; esto sirve para probar la exclusión mutua, pero todavía no equivale a aislamiento de memoria entre procesos.
 
@@ -125,9 +147,9 @@ make test
 
 Revisan la creación de archivos y directorios, lectura, escritura, eliminación, límites y errores de rutas. Corren en Linux sin abrir QEMU. Hay más detalles en [docs/pruebas_vfs.md](docs/pruebas_vfs.md).
 
-Para revisar la planificación y los mutex, usa el ejemplo de la sección anterior dentro de QEMU. Comprueba que los tres hilos queden asociados al mismo PID, que cada uno tenga un TID distinto y que el contador compartido termine en 600. También puedes ejecutar `ps` y `threads` varias veces para observar los estados y los turnos.
+Para revisar la planificación y los mutex, usa el ejemplo de la sección anterior dentro de QEMU. Comprueba que los tres hilos queden asociados al mismo PID, que cada uno tenga un TID distinto y que el contador compartido aumente. Con varios hilos activos, `threads` debe permitir observar hilos en `BLOCKED` mientras esperan el mutex. Para cerrar la prueba, ejecuta `kill` con el PID del proceso y vuelve a consultar `ps` y `threads`. Para la memoria, ejecuta el ejemplo de `meminfo`, `pagealloc` y `pagefree` de la sección anterior; el número de marcos libres debe bajar al reservar la página y recuperarse al liberarla (la tabla de páginas vacía también se devuelve al allocator).
 
-`make test` solo comprueba el VFS; las pruebas de procesos, hilos y sincronización se hacen en QEMU. El shell y los comandos de archivos deben seguir funcionando mientras los hilos reciben sus turnos.
+`make test` solo comprueba el VFS; las pruebas de procesos, hilos, sincronización y paginación se hacen al arrancar el kernel en QEMU. El shell y los comandos de archivos deben seguir funcionando mientras los hilos reciben sus turnos.
 
 ## Crear una ISO
 
