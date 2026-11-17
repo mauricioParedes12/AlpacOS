@@ -4,13 +4,15 @@ AlpacOS es el mini sistema operativo que estamos desarrollando para el curso de 
 
 Está escrito en C11 y Assembly (GNU as), para x86 de 32 bits. Lo ejecutamos en QEMU y se puede compilar desde Linux o desde Windows con Ubuntu en WSL2.
 
-## Avance actual: v0.5.0
+## Avance actual: v0.6.0
 
 El sistema ya arranca con Multiboot y tiene una consola con comandos propios. Cuenta con salida VGA y por puerto serie, teclado PS/2 por interrupciones, un temporizador PIT y un sistema de archivos en RAM. El arranque configura la GDT y la pila; el kernel instala la IDT y el PIC para atender excepciones e interrupciones.
 
-En esta versión agregamos el planificador Round Robin. Los procesos reciben turnos de CPU automáticamente y el shell puede seguir atendiendo comandos mientras trabajan. Usamos el temporizador PIT, que genera unas 100 interrupciones por segundo, con un quantum de 10 ticks: aproximadamente 100 ms por turno.
+En esta versión agregamos hilos del kernel y sincronización. Un proceso puede tener varios hilos, cada uno con su TID, pila y contexto. El planificador Round Robin ahora reparte la CPU entre hilos, no solamente entre procesos.
 
-También quedan pendientes los hilos y la sincronización, la gestión de memoria con paginación y el manejo de deadlocks.
+También incorporamos mutex. Cuando un hilo intenta tomar uno que ya está ocupado, queda en estado `BLOCKED`; al liberarlo, se despierta al siguiente hilo que estaba esperando. El shell incluye comandos para crear hilos y revisar sus estados.
+
+Siguen pendientes la gestión de memoria con paginación y el manejo de deadlocks.
 
 ## Compilar y ejecutar
 
@@ -44,9 +46,11 @@ El teclado está configurado con la distribución estadounidense (US).
 | `uptime` | Indica cuántos segundos lleva encendido el sistema. |
 | `meminfo` | Muestra la memoria reportada al arrancar y el espacio reservado para el kernel. No calcula la RAM libre. |
 | `modules` | Muestra qué partes están implementadas y cuáles faltan. |
-| `ps` | Lista los procesos, sus ticks de CPU y los turnos que han recibido. |
-| `spawn nombre` | Crea y pone en marcha una tarea de prueba de unos cinco segundos de CPU. |
-| `kill PID` | Termina un proceso que esté en estado READY. |
+| `ps` | Lista los procesos, cuántos hilos tienen y sus contadores de CPU. |
+| `threads` | Muestra TID, PID, estado, ticks y turnos de cada hilo, además del contador compartido de la prueba. |
+| `spawn nombre` | Crea un proceso de prueba con su primer hilo. |
+| `thread PID nombre` | Agrega otro hilo al proceso indicado. |
+| `kill PID` | Termina los hilos listos de un proceso, siempre que no tenga hilos bloqueados. |
 | `ls [/ruta]` | Lista el contenido de un directorio. Sin ruta, muestra `/`. |
 | `mkdir /ruta` | Crea un directorio dentro de otro que ya exista. |
 | `touch /ruta` | Crea un archivo vacío. |
@@ -81,52 +85,35 @@ Usamos rutas absolutas, como `/docs/nota.txt`. Los nombres pueden llevar letras,
 
 Este sistema de archivos todavía no tiene permisos, usuarios, montajes ni almacenamiento en disco.
 
-## Procesos y Round Robin
+## Procesos, hilos y Round Robin
 
-Cada proceso tiene un PCB con su PID, nombre, estado y contexto guardado en una pila de 8 KiB. El shell sigue siendo el proceso con PID 0 y podemos tener hasta siete procesos más. Todos son tareas del kernel en ring 0 y comparten memoria; el aislamiento y la paginación siguen pendientes.
+Cada proceso tiene un PCB con PID, nombre, estado, contadores y cantidad de hilos. El shell sigue siendo el proceso con PID 0. Se pueden tener hasta siete procesos de prueba activos.
 
-El planificador usa una cola FIFO. Al crear un proceso, lo agrega al final de la cola de listos. Cuando se acaba el quantum, el proceso que estaba ejecutándose vuelve al final y el primero de la cola recibe la CPU. El shell participa en los mismos turnos. Si no hay otro proceso listo, el actual continúa.
+Cada hilo tiene su propio TCB, TID, estado, contexto y pila de 8 KiB. El límite actual es de 24 hilos en total, incluido el hilo del shell. Los hilos de un mismo proceso comparten los datos del kernel; todavía no hay espacios de direcciones separados ni protección entre procesos.
 
-El cambio se hace al salir de la interrupción del temporizador. `kernel/interrupts/isr.S` guarda los registros generales, los segmentos y el estado de retorno. El planificador elige qué contexto restaurar y la instrucción `iret` reanuda la tarea en el punto donde fue interrumpida. La IRQ se confirma al PIC antes de pasar al siguiente proceso.
+El planificador usa una cola FIFO de hilos. El quantum sigue siendo de 10 ticks del PIT, aproximadamente 100 ms. Cuando termina el turno, el hilo que estaba ejecutándose vuelve al final de la cola y el siguiente recibe la CPU. El cambio de contexto guarda y restaura los registros desde la interrupción del temporizador.
 
-También conservamos `process_yield()` para ceder un turno voluntariamente. Ahora usa una interrupción de software desde `kernel/context.S`, pero las tareas de prueba no la llaman: el temporizador tiene que interrumpirlas para que el resto pueda avanzar. Cuando una tarea termina su función, sale de la planificación automáticamente.
+El módulo de sincronización incluye un mutex no recursivo. Si un hilo intenta bloquear un mutex que pertenece a otro, se agrega a la cola de espera y pasa a `BLOCKED`. Cuando el propietario lo libera, la propiedad se transfiere al siguiente hilo y este vuelve a `READY`. Si un hilo intenta bloquear dos veces el mismo mutex, la operación falla en vez de dejarlo esperando por sí mismo. La detección de deadlocks todavía no está implementada.
 
-Las actualizaciones de los PCB, la cola y la salida de consola se protegen con secciones cortas en las que se desactivan las interrupciones. Seguimos trabajando con una sola CPU virtual y sin mutex ni semáforos.
+### Probar procesos, hilos y mutex
 
-### Probar la planificación
-
-Después de arrancar AlpacOS, ejecuta:
+Arranca AlpacOS y ejecuta estos comandos:
 
 ```text
-spawn tareaA
-spawn tareaB
+spawn grupo
+thread 1 hiloB
+thread 1 hiloC
 ps
-uptime
+threads
 ```
 
-Espera un par de segundos y vuelve a escribir `ps`. Los valores de TICKS y TURNOS de ambas tareas deberían haber aumentado, aunque no hayas ejecutado ningún comando para darles CPU. El comando `run` de la versión anterior ya no se usa y se retiró del shell.
+`spawn` crea el proceso `grupo` con un hilo inicial. Los otros dos comandos agregan hilos al mismo PID. Los tres ejecutan una tarea de prueba que incrementa un contador compartido 200 veces. Cada hilo cede una vez la CPU mientras tiene tomado el mutex para que otro pueda intentar entrar y quedar bloqueado. Después mantiene el proceso ocupado unos cinco segundos de CPU para que puedas agregar los hilos desde el shell.
 
-En la salida de `ps`:
+En `threads` puedes revisar los estados `READY`, `RUNNING`, `BLOCKED` y `TERMINATED`. El contador del proceso debe llegar a 600 cuando hayan terminado los tres hilos. Si ejecutas el comando antes de que acaben, vuelve a consultarlo para ver el avance. `ps` muestra el estado general del proceso y el total de hilos que siguen activos.
 
-- **TICKS** cuenta las interrupciones del PIT recibidas mientras ese proceso tenía la CPU.
-- **TURNOS** cuenta cuántas veces el planificador le entregó la CPU.
-- **READY** indica que espera su turno, **RUNNING** que está ejecutándose y **TERMINATED** que ya terminó.
+`kill PID` puede terminar los hilos que estén listos, pero no mata un proceso si alguno de sus hilos está bloqueado esperando un mutex. Esta restricción evita dejar referencias a TID que ya no existen en la cola de espera.
 
-La tarea de prueba hace trabajo continuo, sin `yield` ni `hlt`, hasta acumular unos 500 ticks de CPU. Después termina sola. Con varios procesos, tarda más de cinco segundos de reloj porque comparte los turnos con los demás. El progreso se consulta con `ps`; las tareas no imprimen mensajes en segundo plano para no cortar lo que estás escribiendo.
-
-Estos contadores sirven para observar el reparto de turnos. En el caso del shell, sus ticks también incluyen el tiempo que pasa esperando entrada con `hlt`, así que no representan un porcentaje exacto de uso de CPU.
-
-Mientras las tareas trabajan, puedes probar los comandos de archivos o terminar una con `kill`, usando el PID que te haya devuelto `spawn`:
-
-```text
-kill 1
-ps
-spawn tareaC
-```
-
-Los procesos terminados permanecen en la lista hasta que se reutiliza su plaza, con un PID nuevo. Si ya llenaste las siete plazas, tendrás que esperar a que termine una tarea o usar `kill` antes de crear otra. Los nombres siguen admitiendo de 1 a 23 caracteres.
-
-`spawn` crea instancias de la misma función de prueba, cada una con su propia pila y contexto. Todavía no carga programas desde archivos. Como todo se ejecuta en ring 0, una tarea que desactive las interrupciones de forma permanente puede detener la planificación; aún no hay protección frente a ese caso.
+Los procesos y sus hilos siguen ejecutándose en ring 0 y comparten el espacio de memoria del kernel. El ejemplo usa un contador global asociado al PID; esto sirve para probar la exclusión mutua, pero todavía no equivale a aislamiento de memoria entre procesos.
 
 ## Pruebas
 
@@ -138,9 +125,9 @@ make test
 
 Revisan la creación de archivos y directorios, lectura, escritura, eliminación, límites y errores de rutas. Corren en Linux sin abrir QEMU. Hay más detalles en [docs/pruebas_vfs.md](docs/pruebas_vfs.md).
 
-Para revisar Round Robin, usa el ejemplo anterior dentro de QEMU y comprueba que los contadores aumenten sin intervención manual. Prueba también llenar las siete plazas, terminar una tarea y crear otra; la nueva debe recibir un PID distinto y llevar sus propios contadores. `kill 0`, `kill -1`, `kill 999` y `kill 4294967296` deben mostrar un error sin bloquear el sistema.
+Para revisar la planificación y los mutex, usa el ejemplo de la sección anterior dentro de QEMU. Comprueba que los tres hilos queden asociados al mismo PID, que cada uno tenga un TID distinto y que el contador compartido termine en 600. También puedes ejecutar `ps` y `threads` varias veces para observar los estados y los turnos.
 
-`make test` solo comprueba el VFS; las pruebas del arranque y de la planificación se hacen en QEMU. El shell y los comandos de archivos deben seguir funcionando mientras las tareas reciben sus turnos.
+`make test` solo comprueba el VFS; las pruebas de procesos, hilos y sincronización se hacen en QEMU. El shell y los comandos de archivos deben seguir funcionando mientras los hilos reciben sus turnos.
 
 ## Crear una ISO
 
