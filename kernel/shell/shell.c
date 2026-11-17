@@ -1,5 +1,6 @@
 #include <alpacos/bootinfo.h>
 #include <alpacos/console.h>
+#include <alpacos/deadlock.h>
 #include <alpacos/interrupts.h>
 #include <alpacos/io.h>
 #include <alpacos/kstring.h>
@@ -54,6 +55,7 @@ static const command_t commands[] = {
     {"pagealloc", "Reserva y mapea una pagina virtual de prueba", cmd_pagealloc},
     {"pagefree", "Desmapea y libera una pagina: pagefree 0xD0000000", cmd_pagefree},
     {"modules", "Muestra el estado real de los modulos", cmd_modules},
+    {"deadlock", "Demo, deteccion y recuperacion: deadlock demo|check|resolve", deadlock_command},
     {"ps", "Lista procesos y cantidad de hilos", cmd_ps},
     {"threads", "Lista hilos, estados, turnos y contador compartido", cmd_threads},
     {"spawn", "Crea un proceso con su primer hilo: spawn nombre", cmd_spawn},
@@ -258,7 +260,7 @@ static void cmd_modules(size_t argc, char **argv)
     console_writeln("[OK] Allocator de marcos de 4 KiB y paginacion x86 activa");
     console_writeln("[OK] Mapeo identidad de 64 MiB y paginas virtuales de prueba");
     console_writeln("[OK] VFS en RAM: directorios y archivos (sin persistencia)");
-    console_writeln("[TODO] Deteccion/gestion de deadlocks");
+    console_writeln("[OK] Deteccion de ciclos y recuperacion de deadlocks con mutex");
 }
 
 static bool require_args(size_t argc, size_t expected, const char *usage)
