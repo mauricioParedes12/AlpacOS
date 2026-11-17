@@ -23,7 +23,7 @@ LDFLAGS := -m elf_i386 -nostdlib --build-id=none -T boot/linker.ld \
            -Map=$(BUILD)/alpacos.map
 
 C_SOURCES := kernel/main.c kernel/bootinfo.c kernel/console.c kernel/memory.c kernel/process.c \
-             kernel/interrupts/interrupts.c kernel/sync.c kernel/fs/vfs.c \
+             kernel/interrupts/interrupts.c kernel/sync.c kernel/deadlock.c kernel/fs/vfs.c \
              kernel/shell/shell.c kernel/shell/parser.c \
              drivers/vga.c drivers/serial.c drivers/keyboard.c drivers/timer.c \
              lib/kstring.c
