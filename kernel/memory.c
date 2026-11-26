@@ -22,9 +22,31 @@ typedef struct {
     uintptr_t base;
     uint32_t pages, resident, faults;
     bool writable;
+    uint32_t resident_limit, evictions, restores; /* Limite cero: demanda sin FIFO. */
+    size_t fifo_head, fifo_tail;
 } demand_region_t;
 static demand_region_t regions[MEMORY_MAX_REGIONS];
 static uint32_t demand_faults;
+
+#define NO_FIFO_PAGE MEMORY_BACKING_PAGES
+typedef struct {
+    demand_region_t *owner;
+    uintptr_t address, frame;
+    size_t next;
+    bool stored;
+} fifo_page_t;
+static fifo_page_t fifo_pages[MEMORY_BACKING_PAGES];
+/* Respaldo educativo preasignado en BSS. Cada slot pertenece a una unica
+   pagina virtual; nunca se mezcla con los marcos residentes del allocator. */
+static _Alignas(4096) unsigned char backing[MEMORY_BACKING_PAGES][MEMORY_PAGE_SIZE];
+static uint32_t fifo_evictions, fifo_restores;
+
+static void release_backing(demand_region_t *region)
+{
+    for (size_t i = 0u; i < MEMORY_BACKING_PAGES; ++i) {
+        if (fifo_pages[i].owner == region) memset(&fifo_pages[i], 0, sizeof(fifo_pages[i]));
+    }
+}
 
 static demand_region_t *region_at(memory_space_t space, uintptr_t address)
 {
@@ -194,6 +216,16 @@ static bool map_page(memory_space_t space, uintptr_t address, bool writable, uin
     *physical_out = physical;
     return true;
 }
+static void prune_table(memory_space_t space, uint32_t d)
+{
+    uint32_t *directory = (void *)space;
+    if ((directory[d] & PRESENT) == 0u) return;
+    uint32_t *table = (void *)(uintptr_t)(directory[d] & ADDRESS);
+    for (uint32_t i = 0u; i < ENTRIES; ++i) if ((table[i] & PRESENT) != 0u) return;
+    uintptr_t frame = directory[d] & ADDRESS;
+    directory[d] = 0u;
+    (void)release(frame, FRAME_TABLE);
+}
 static bool unmap_page(memory_space_t space, uintptr_t address, uintptr_t *physical_out)
 {
     uint32_t *directory = (void *)space;
@@ -206,13 +238,7 @@ static bool unmap_page(memory_space_t space, uintptr_t address, uintptr_t *physi
     }
     table[p] = 0u;
     invalidate(space, address);
-    bool empty = true;
-    for (uint32_t i = 0; i < ENTRIES; ++i) if ((table[i] & PRESENT) != 0u) { empty = false; break; }
-    if (empty) {
-        uintptr_t frame = directory[d] & ADDRESS;
-        directory[d] = 0u;
-        (void)release(frame, FRAME_TABLE);
-    }
+    prune_table(space, d);
     if (physical_out != NULL) *physical_out = physical;
     return true;
 }
@@ -242,7 +268,8 @@ static bool page_present(memory_space_t space, uintptr_t address)
     return (table[(address >> 12) & 1023u] & PRESENT) != 0u;
 }
 
-bool memory_space_reserve(memory_space_t space, uintptr_t base, uint32_t pages, bool writable)
+static bool reserve_region(memory_space_t space, uintptr_t base, uint32_t pages,
+                            uint32_t resident_limit, bool writable)
 {
     uint32_t flags = interrupts_save();
     uint64_t end = (uint64_t)base + (uint64_t)pages * MEMORY_PAGE_SIZE;
@@ -260,14 +287,44 @@ bool memory_space_reserve(memory_space_t space, uintptr_t base, uint32_t pages, 
         }
     }
     if (available == NULL) { interrupts_restore(flags); return false; }
+    if (resident_limit != 0u) {
+        size_t free_slots = 0u;
+        for (size_t i = 0u; i < MEMORY_BACKING_PAGES; ++i)
+            if (fifo_pages[i].owner == NULL) ++free_slots;
+        if (pages > free_slots || resident_limit > pages) {
+            interrupts_restore(flags); return false;
+        }
+    }
     for (uint32_t i = 0u; i < pages; ++i) {
         if (page_present(space, base + i * MEMORY_PAGE_SIZE)) {
             interrupts_restore(flags); return false;
         }
     }
-    *available = (demand_region_t){.space = space, .base = base, .pages = pages, .writable = writable};
+    *available = (demand_region_t){.space = space, .base = base, .pages = pages,
+        .writable = writable, .resident_limit = resident_limit,
+        .fifo_head = NO_FIFO_PAGE, .fifo_tail = NO_FIFO_PAGE};
+    if (resident_limit != 0u) {
+        uint32_t assigned = 0u;
+        for (size_t i = 0u; i < MEMORY_BACKING_PAGES && assigned < pages; ++i) {
+            if (fifo_pages[i].owner != NULL) continue;
+            fifo_pages[i] = (fifo_page_t){.owner = available,
+                .address = base + assigned * MEMORY_PAGE_SIZE, .next = NO_FIFO_PAGE};
+            ++assigned;
+        }
+    }
     interrupts_restore(flags);
     return true;
+}
+
+bool memory_space_reserve(memory_space_t space, uintptr_t base, uint32_t pages, bool writable)
+{
+    return reserve_region(space, base, pages, 0u, writable);
+}
+bool memory_space_reserve_fifo(memory_space_t space, uintptr_t base, uint32_t pages,
+                                uint32_t resident_limit, bool writable)
+{
+    if (resident_limit == 0u || resident_limit > pages || pages > MEMORY_BACKING_PAGES) return false;
+    return reserve_region(space, base, pages, resident_limit, writable);
 }
 
 bool memory_space_unreserve(memory_space_t space, uintptr_t base)
@@ -281,6 +338,11 @@ bool memory_space_unreserve(memory_space_t space, uintptr_t base)
         uintptr_t address = base + i * MEMORY_PAGE_SIZE;
         if (page_present(space, address)) (void)unmap_page(space, address, NULL);
     }
+    /* FIFO conserva las tablas vacias para recargar sin otra asignacion.
+       Al liberar la region tambien hay que devolver esas tablas. */
+    uint32_t last_directory = (base + (region->pages - 1u) * MEMORY_PAGE_SIZE) >> 22;
+    for (uint32_t d = base >> 22; d <= last_directory; ++d) prune_table(space, d);
+    release_backing(region);
     memset(region, 0, sizeof(*region));
     interrupts_restore(flags);
     return true;
@@ -297,9 +359,78 @@ bool memory_space_demand_info(memory_space_t space, memory_demand_info_t *info)
         info->reserved_pages += regions[i].pages;
         info->resident_pages += regions[i].resident;
         info->handled_faults += regions[i].faults;
+        if (regions[i].resident_limit != 0u) {
+            ++info->fifo_regions;
+            info->fifo_limit += regions[i].resident_limit;
+            info->fifo_resident += regions[i].resident;
+            info->evictions += regions[i].evictions;
+            info->restores += regions[i].restores;
+        }
+    }
+    for (size_t i = 0u; i < MEMORY_BACKING_PAGES; ++i) {
+        const fifo_page_t *page = &fifo_pages[i];
+        if (page->owner == NULL || page->owner->space != space) continue;
+        ++info->backing_used;
+        if (page->stored && page->frame == 0u) ++info->swapped_pages;
     }
     interrupts_restore(flags);
     return true;
+}
+
+/* Carga una pagina FIFO sin tocar paginas ni pilas ajenas a su region.
+   La preparacion que puede fallar se completa antes de desalojar la victima. */
+static bool fifo_load(demand_region_t *region, uintptr_t address)
+{
+    size_t target = NO_FIFO_PAGE;
+    for (size_t i = 0u; i < MEMORY_BACKING_PAGES; ++i) {
+        if (fifo_pages[i].owner == region && fifo_pages[i].address == address) { target = i; break; }
+    }
+    if (target == NO_FIFO_PAGE || fifo_pages[target].frame != 0u) return false;
+    uint32_t *directory = (void *)region->space;
+    uint32_t d = address >> 22, p = (address >> 12) & 1023u;
+    bool new_table = (directory[d] & PRESENT) == 0u;
+    uintptr_t table_address = new_table ? allocate(FRAME_TABLE) : directory[d] & ADDRESS;
+    if (table_address == 0u) return false;
+    uintptr_t physical = region->resident < region->resident_limit ? allocate(FRAME_PAGE) : 0u;
+    if (physical == 0u) {
+        size_t victim_index = region->fifo_head;
+        if (victim_index == NO_FIFO_PAGE) {
+            if (new_table) (void)release(table_address, FRAME_TABLE);
+            return false;
+        }
+        fifo_page_t *victim = &fifo_pages[victim_index];
+        physical = victim->frame;
+        memcpy(backing[victim_index], (const void *)physical, MEMORY_PAGE_SIZE);
+        victim->stored = true;
+        uint32_t *old_table = (void *)(uintptr_t)(directory[victim->address >> 22] & ADDRESS);
+        old_table[(victim->address >> 12) & 1023u] = 0u;
+        invalidate(region->space, victim->address);
+        victim->frame = 0u;
+        region->fifo_head = victim->next;
+        if (region->fifo_head == NO_FIFO_PAGE) region->fifo_tail = NO_FIFO_PAGE;
+        victim->next = NO_FIFO_PAGE;
+        --region->resident;
+        ++region->evictions;
+        ++fifo_evictions;
+    }
+    fifo_page_t *page = &fifo_pages[target];
+    if (page->stored) {
+        memcpy((void *)physical, backing[target], MEMORY_PAGE_SIZE);
+        ++region->restores;
+        ++fifo_restores;
+    } else {
+        memset((void *)physical, 0, MEMORY_PAGE_SIZE);
+    }
+    uint32_t *table = (void *)table_address;
+    directory[d] = table_address | PRESENT | WRITABLE;
+    table[p] = physical | PRESENT | (region->writable ? WRITABLE : 0u);
+    invalidate(region->space, address);
+    page->frame = physical;
+    page->next = NO_FIFO_PAGE;
+    if (region->fifo_tail == NO_FIFO_PAGE) region->fifo_head = target;
+    else fifo_pages[region->fifo_tail].next = target;
+    region->fifo_tail = target;
+    return true; /* El llamador actualiza residentes y fallos. */
 }
 
 memory_fault_result_t memory_handle_page_fault(uintptr_t address, uint32_t error)
@@ -314,7 +445,9 @@ memory_fault_result_t memory_handle_page_fault(uintptr_t address, uint32_t error
         interrupts_restore(flags); return MEMORY_FAULT_INVALID;
     }
     uintptr_t physical;
-    if (!map_page(active_space, address & ADDRESS, region->writable, &physical)) {
+    bool loaded = region->resident_limit != 0u ? fifo_load(region, address & ADDRESS) :
+        map_page(active_space, address & ADDRESS, region->writable, &physical);
+    if (!loaded) {
         interrupts_restore(flags); return MEMORY_FAULT_NO_MEMORY;
     }
     ++region->resident;
@@ -357,7 +490,10 @@ bool memory_space_destroy(memory_space_t space)
     bool result = release(space, FRAME_DIRECTORY);
     if (result) {
         for (size_t i = 0u; i < MEMORY_MAX_REGIONS; ++i) {
-            if (regions[i].space == space) memset(&regions[i], 0, sizeof(regions[i]));
+            if (regions[i].space == space) {
+                release_backing(&regions[i]);
+                memset(&regions[i], 0, sizeof(regions[i]));
+            }
         }
     }
     interrupts_restore(flags);
@@ -374,10 +510,16 @@ void memory_get_stats(memory_stats_t *stats)
     *stats = (memory_stats_t){.total_frames = total_frames, .used_frames = used_frames,
         .free_frames = total_frames - used_frames, .reserved_frames = reserved_frames,
         .paging_enabled = initialized && (cr0 & 0x80000000u) != 0u,
-        .uses_memory_map = uses_memory_map, .demand_faults = demand_faults};
+        .uses_memory_map = uses_memory_map, .demand_faults = demand_faults,
+        .fifo_evictions = fifo_evictions, .fifo_restores = fifo_restores};
     for (size_t i = 0u; i < MEMORY_MAX_REGIONS; ++i) {
         stats->demand_reserved_pages += regions[i].pages;
         stats->demand_resident_pages += regions[i].resident;
+    }
+    for (size_t i = 0u; i < MEMORY_BACKING_PAGES; ++i) {
+        if (fifo_pages[i].owner == NULL) continue;
+        ++stats->backing_used;
+        if (fifo_pages[i].stored && fifo_pages[i].frame == 0u) ++stats->swapped_pages;
     }
     interrupts_restore(flags);
 }

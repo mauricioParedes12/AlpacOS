@@ -10,15 +10,19 @@
 #define MEMORY_TEST_PAGE_COUNT 16u
 #define MEMORY_MAX_REGIONS 64u /* Compartidas entre los espacios de trabajo. */
 #define MEMORY_REGION_MAX_PAGES 1024u
+#define MEMORY_BACKING_PAGES 64u /* 256 KiB de respaldo RAM estatico, no disco. */
 /* Un espacio es la direccion fisica de su directorio de paginas. */
 typedef uintptr_t memory_space_t;
 typedef struct {
     uint32_t total_frames, used_frames, free_frames, reserved_frames;
     bool paging_enabled, uses_memory_map;
     uint32_t demand_reserved_pages, demand_resident_pages, demand_faults;
+    uint32_t backing_used, swapped_pages, fifo_evictions, fifo_restores;
 } memory_stats_t;
 typedef struct {
     uint32_t regions, reserved_pages, resident_pages, handled_faults;
+    uint32_t fifo_regions, fifo_limit, fifo_resident, backing_used, swapped_pages;
+    uint32_t evictions, restores;
 } memory_demand_info_t;
 typedef enum {
     MEMORY_FAULT_INVALID, MEMORY_FAULT_RESOLVED, MEMORY_FAULT_NO_MEMORY
@@ -39,6 +43,13 @@ bool memory_space_translate(memory_space_t space, uintptr_t virtual_address, uin
    El primer acceso valido obtiene una pagina inicializada completamente a cero.
    writable=false permite leer, pero no escribir (tambien en ring 0 con CR0.WP). */
 bool memory_space_reserve(memory_space_t space, uintptr_t base, uint32_t pages, bool writable);
+/* Variante con FIFO local a la region: 1 <= resident_limit <= pages <= 64.
+   Reserva un slot de respaldo RAM por pagina para garantizar que una victima
+   pueda guardarse. No asigna marcos residentes ni tablas al reservar.
+   Esta area de respaldo pertenece al kernel: no aumenta la RAM disponible.
+   Los accesos a paginas ya presentes no cambian el orden FIFO. */
+bool memory_space_reserve_fifo(memory_space_t space, uintptr_t base, uint32_t pages,
+                                uint32_t resident_limit, bool writable);
 /* Libera la region completa y todas sus paginas residentes. Las funciones
    alloc/free de una pagina no pueden modificar una region reservada. */
 bool memory_space_unreserve(memory_space_t space, uintptr_t base);
