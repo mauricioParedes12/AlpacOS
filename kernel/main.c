@@ -50,7 +50,7 @@ _Noreturn void kernel_main(uint32_t magic, const multiboot_info_prefix_t *info)
     console_writeln("[OK] Hilos, idle, sleep, mutex y semaforos con colas de espera.");
     console_writeln("[OK] Marcos de 4 KiB, mapa de RAM y paginacion x86 activa.");
     console_writeln("[OK] Regiones anonimas y paginas asignadas bajo demanda.");
-    console_writeln("[OK] Reemplazo FIFO por region con respaldo en RAM (sin swap en disco).");
+    console_writeln("[OK] Reemplazo FIFO/Clock por region con respaldo en RAM (sin swap en disco).");
     console_writeln("[OK] Deteccion y recuperacion de deadlocks.");
     console_writeln("[OK] Directorio de paginas propio por proceso (ejecucion en ring 0).");
     console_writeln("Escribe help para ver los comandos.\n");

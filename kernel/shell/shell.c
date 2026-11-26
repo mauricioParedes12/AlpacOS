@@ -29,6 +29,8 @@ static void cmd_faultdemo(size_t argc, char **argv);
 static void cmd_demanddemo(size_t argc, char **argv);
 static void cmd_vmstat(size_t argc, char **argv);
 static void cmd_fifodemo(size_t argc, char **argv);
+static void cmd_clockdemo(size_t argc, char **argv);
+static void cmd_vmcompare(size_t argc, char **argv);
 static void cmd_help(size_t argc, char **argv);
 static void cmd_clear(size_t argc, char **argv);
 static void cmd_echo(size_t argc, char **argv);
@@ -63,6 +65,8 @@ static const command_t commands[] = {
     {"demanddemo", "Reserva cuatro paginas y las usa de una en una", cmd_demanddemo},
     {"vmstat", "Paginas reservadas, residentes y fallos atendidos: vmstat PID", cmd_vmstat},
     {"fifodemo", "Reemplazo con respaldo RAM: fifodemo [paginas marcos]", cmd_fifodemo},
+    {"clockdemo", "Segunda oportunidad: clockdemo [paginas marcos]", cmd_clockdemo},
+    {"vmcompare", "Compara FIFO y Clock con la misma secuencia: vmcompare [marcos]", cmd_vmcompare},
     {"help", "Lista los comandos disponibles", cmd_help},
     {"clear", "Limpia la consola", cmd_clear},
     {"echo", "Muestra los argumentos separados por espacios", cmd_echo},
@@ -176,12 +180,18 @@ static void cmd_meminfo(size_t argc, char **argv)
     console_write(" residentes="); console_uint(stats.demand_resident_pages);
     console_write(" fallos_atendidos="); console_uint(stats.demand_faults);
     console_writeln(" (fallos acumulados desde el arranque)");
-    console_write("FIFO: respaldo_RAM="); console_uint(stats.backing_used);
+    console_write("Reemplazo: respaldo_RAM="); console_uint(stats.backing_used);
     console_putc('/'); console_uint(MEMORY_BACKING_PAGES);
     console_write(" paginas, fuera="); console_uint(stats.swapped_pages);
-    console_write(" reemplazos="); console_uint(stats.fifo_evictions);
+    console_writeln(" (ocupacion actual; sin swap en disco)");
+    console_write("FIFO acumulado: reemplazos="); console_uint(stats.fifo_evictions);
     console_write(" recuperaciones="); console_uint(stats.fifo_restores);
-    console_writeln(" (acumulados; sin swap en disco)");
+    console_putc('\n');
+    console_write("Clock acumulado: reemplazos="); console_uint(stats.clock_evictions);
+    console_write(" recuperaciones="); console_uint(stats.clock_restores);
+    console_write(" inspecciones="); console_uint(stats.clock_scans);
+    console_write(" segundas_oportunidades="); console_uint(stats.clock_second_chances);
+    console_putc('\n');
     console_write("Kernel: ");
     console_hex((uint32_t)info->kernel_start);
     console_write(" - ");
@@ -289,7 +299,8 @@ static void cmd_modules(size_t argc, char **argv)
     console_writeln("[OK] Hilos del kernel y Round Robin por TID");
     console_writeln("[OK] Mutex, semaforos, sleep e idle; limpieza al finalizar");
     console_writeln("[OK] Allocator de marcos de 4 KiB y paginacion x86 activa");
-    console_writeln("[OK] Demanda y FIFO por region con respaldo RAM; sin swap en disco");
+    console_writeln("[OK] Demanda y FIFO/Clock por region con respaldo RAM; sin swap en disco");
+    console_writeln("[OK] Comparacion FIFO/Clock con accesos reales y verificacion de datos");
     console_writeln("[OK] CR3 por proceso y pagina privada en 0x40000000");
     console_writeln("[OK] VFS con nodos, operaciones y montajes; backend RAMFS sin persistencia");
     console_writeln("[OK] Deteccion de ciclos y recuperacion de deadlocks con mutex");
@@ -856,49 +867,61 @@ static void cmd_vmstat(size_t argc, char **argv)
         console_write("FIFO: regiones="); console_uint(info.fifo_regions);
         console_write(" limite="); console_uint(info.fifo_limit);
         console_write(" residentes="); console_uint(info.fifo_resident);
-        console_write(" fuera="); console_uint(info.swapped_pages);
-        console_write(" reemplazos="); console_uint(info.evictions);
-        console_write(" recuperaciones="); console_uint(info.restores);
-        console_write(" respaldo_RAM="); console_uint(info.backing_used);
+        console_write(" fuera="); console_uint(info.swapped_pages - info.clock_swapped_pages);
+        console_write(" reemplazos="); console_uint(info.evictions - info.clock_evictions);
+        console_write(" recuperaciones="); console_uint(info.restores - info.clock_restores);
+        console_write(" respaldo_RAM="); console_uint(info.backing_used - info.clock_backing_used);
+        console_putc('\n');
+        console_write("Clock: regiones="); console_uint(info.clock_regions);
+        console_write(" limite="); console_uint(info.clock_limit);
+        console_write(" residentes="); console_uint(info.clock_resident);
+        console_write(" fuera="); console_uint(info.clock_swapped_pages);
+        console_write(" reemplazos="); console_uint(info.clock_evictions);
+        console_write(" recuperaciones="); console_uint(info.clock_restores);
+        console_write(" respaldo_RAM="); console_uint(info.clock_backing_used);
+        console_write(" inspecciones="); console_uint(info.clock_scans);
+        console_write(" segundas_oportunidades="); console_uint(info.clock_second_chances);
         console_putc('\n');
     }
     interrupts_restore(flags);
 }
 
-#define FIFO_DEMO_BASE 0x60000000u
+#define REPLACEMENT_DEMO_BASE 0x60000000u
 
-static uint32_t fifo_pattern(uint32_t pid, uint32_t page, uint32_t word)
+static uint32_t replacement_pattern(uint32_t pid, uint32_t page, uint32_t word)
 {
     return (pid * 0x01010101u) ^ (page << 16) ^ word;
 }
 
-static void fifo_worker(void)
+static void replacement_worker(void)
 {
     memory_space_t space = memory_space_current();
     memory_demand_info_t info;
-    if (!memory_space_demand_info(space, &info) || info.fifo_regions != 1u) return;
+    if (!memory_space_demand_info(space, &info) || info.fifo_regions + info.clock_regions != 1u) return;
+    bool clock = info.clock_regions == 1u;
     uint32_t pages = info.reserved_pages, pid = process_current_pid();
     bool valid = true;
     for (uint32_t i = 0u; i < pages; ++i) {
         thread_sleep(25u);
-        volatile uint32_t *page = (volatile uint32_t *)(FIFO_DEMO_BASE + i * MEMORY_PAGE_SIZE);
+        volatile uint32_t *page = (volatile uint32_t *)(REPLACEMENT_DEMO_BASE + i * MEMORY_PAGE_SIZE);
         for (uint32_t j = 0u; j < MEMORY_PAGE_SIZE / sizeof(uint32_t); ++j) {
             if (page[j] != 0u) valid = false;
-            page[j] = fifo_pattern(pid, i, j);
+            page[j] = replacement_pattern(pid, i, j);
         }
     }
     /* Una segunda pasada obliga a recuperar las paginas que salieron. */
     for (uint32_t i = 0u; i < pages; ++i) {
         thread_sleep(25u);
-        volatile uint32_t *page = (volatile uint32_t *)(FIFO_DEMO_BASE + i * MEMORY_PAGE_SIZE);
+        volatile uint32_t *page = (volatile uint32_t *)(REPLACEMENT_DEMO_BASE + i * MEMORY_PAGE_SIZE);
         for (uint32_t j = 0u; j < MEMORY_PAGE_SIZE / sizeof(uint32_t); ++j)
-            if (page[j] != fifo_pattern(pid, i, j)) valid = false;
+            if (page[j] != replacement_pattern(pid, i, j)) valid = false;
     }
-    if (!memory_space_demand_info(space, &info) || info.fifo_resident > info.fifo_limit) valid = false;
+    if (!memory_space_demand_info(space, &info) || info.fifo_resident > info.fifo_limit ||
+        info.clock_resident > info.clock_limit) valid = false;
     uint32_t flags = interrupts_save();
-    console_write("\n[FIFO] PID "); console_uint(pid);
+    console_write(clock ? "\n[Clock] PID " : "\n[FIFO] PID "); console_uint(pid);
     console_write(valid ? ": datos verificados. Paginas=" : ": ERROR de datos. Paginas=");
-    console_uint(pages); console_write(" marcos="); console_uint(info.fifo_resident);
+    console_uint(pages); console_write(" marcos="); console_uint(info.resident_pages);
     console_write(" fallos="); console_uint(info.handled_faults);
     console_write(" reemplazos="); console_uint(info.evictions);
     console_write(" recuperaciones="); console_uint(info.restores);
@@ -908,11 +931,12 @@ static void fifo_worker(void)
     for (;;) thread_sleep(100u);
 }
 
-static void cmd_fifodemo(size_t argc, char **argv)
+static void start_replacement_demo(size_t argc, char **argv, bool clock)
 {
     uint32_t pages = 6u, frames = 3u;
     if (argc != 1u && argc != 3u) {
-        console_writeln("Uso: fifodemo [paginas marcos] (por defecto: 6 3)"); return;
+        console_writeln(clock ? "Uso: clockdemo [paginas marcos] (por defecto: 6 3)"
+                              : "Uso: fifodemo [paginas marcos] (por defecto: 6 3)"); return;
     }
     if (argc == 3u && (!parse_pid(argv[1], &pages) || !parse_pid(argv[2], &frames))) {
         console_writeln("Error: paginas y marcos deben ser enteros positivos."); return;
@@ -921,17 +945,128 @@ static void cmd_fifodemo(size_t argc, char **argv)
         console_writeln("Error: usa 1 <= marcos <= paginas <= 64."); return;
     }
     uint32_t flags = interrupts_save();
-    uint32_t pid = process_spawn("fifo", fifo_worker);
+    uint32_t pid = process_spawn(clock ? "clock" : "fifo", replacement_worker);
     process_info_t process;
     if (pid == 0u || !process_find_info(pid, &process) ||
-        !memory_space_reserve_fifo(process.address_space, FIFO_DEMO_BASE, pages, frames, true)) {
+        !(clock ? memory_space_reserve_clock(process.address_space, REPLACEMENT_DEMO_BASE, pages, frames, true)
+                : memory_space_reserve_fifo(process.address_space, REPLACEMENT_DEMO_BASE, pages, frames, true))) {
         if (pid != 0u) (void)process_kill(pid);
         console_writeln("Error: sin recursos para el proceso, la region o su respaldo RAM.");
     } else {
-        console_write("FIFO iniciado. PID: "); console_uint(pid);
+        console_write(clock ? "Clock iniciado. PID: " : "FIFO iniciado. PID: "); console_uint(pid);
         console_write(". Paginas="); console_uint(pages);
         console_write(" limite_residente="); console_uint(frames);
         console_writeln(" residentes=0. Respaldo en RAM, no en disco.");
+    }
+    interrupts_restore(flags);
+}
+
+static void cmd_fifodemo(size_t argc, char **argv) { start_replacement_demo(argc, argv, false); }
+static void cmd_clockdemo(size_t argc, char **argv) { start_replacement_demo(argc, argv, true); }
+
+#define COMPARE_PAGES 5u
+static const uint8_t comparison_trace[] = {
+    0, 1, 2, 3, 1, 4, 1, 2, 0, 3, 4, 2, 0, 1, 4, 3, 0, 1, 2, 4, 1, 0, 3, 4
+};
+
+static uint32_t comparison_value(uint32_t page, uint32_t word, uint32_t generation)
+{
+    return replacement_pattern(process_current_pid(), page, word) ^ (generation * 0x00010001u);
+}
+
+static bool comparison_pass(memory_demand_info_t *measured)
+{
+    uint32_t visits[COMPARE_PAGES] = {0};
+    bool valid = true;
+    for (size_t i = 0u; i < sizeof(comparison_trace); ++i) {
+        thread_sleep(5u);
+        uint32_t p = comparison_trace[i];
+        volatile uint32_t *page = (volatile uint32_t *)(REPLACEMENT_DEMO_BASE + p * MEMORY_PAGE_SIZE);
+        /* Cada referencia logica verifica y actualiza los 4 KiB de la pagina.
+           Las lecturas/escrituras restantes son hits de esa misma pagina. */
+        for (uint32_t w = 0u; w < MEMORY_PAGE_SIZE / sizeof(uint32_t); ++w) {
+            uint32_t expected = visits[p] == 0u ? 0u : comparison_value(p, w, visits[p]);
+            if (page[w] != expected) valid = false;
+            page[w] = comparison_value(p, w, visits[p] + 1u);
+        }
+        ++visits[p];
+    }
+    if (!memory_space_demand_info(memory_space_current(), measured)) return false;
+    /* Captura las metricas ANTES de verificar todas las paginas al final:
+       esta comprobacion puede causar fallos adicionales y no pertenece a la traza. */
+    for (uint32_t p = 0u; p < COMPARE_PAGES; ++p) {
+        volatile uint32_t *page = (volatile uint32_t *)(REPLACEMENT_DEMO_BASE + p * MEMORY_PAGE_SIZE);
+        for (uint32_t w = 0u; w < MEMORY_PAGE_SIZE / sizeof(uint32_t); ++w)
+            if (page[w] != comparison_value(p, w, visits[p])) valid = false;
+    }
+    return valid;
+}
+
+static void comparison_row(const char *name, const memory_demand_info_t *info, bool clock)
+{
+    console_write(name);
+    console_write(" fallos="); console_uint(info->handled_faults);
+    console_write(" reemplazos="); console_uint(info->evictions);
+    console_write(" recuperaciones="); console_uint(info->restores);
+    console_write(" inspecciones="); console_uint(clock ? info->clock_scans : info->evictions);
+    console_write(" segundas_oportunidades="); console_uint(info->clock_second_chances);
+    console_putc('\n');
+}
+
+static void comparison_worker(void)
+{
+    memory_space_t space = memory_space_current();
+    memory_demand_info_t fifo, clock;
+    if (!memory_space_demand_info(space, &fifo) || fifo.fifo_regions != 1u) return;
+    uint32_t frames = fifo.fifo_limit;
+    bool valid = comparison_pass(&fifo);
+    /* Recicla la misma reserva sin que otro proceso pueda tomar sus slots
+       entre ambas politicas. Cada pasada empieza sin paginas residentes. */
+    uint32_t flags = interrupts_save();
+    bool reset = memory_space_unreserve(space, REPLACEMENT_DEMO_BASE) &&
+        memory_space_reserve_clock(space, REPLACEMENT_DEMO_BASE, COMPARE_PAGES, frames, true);
+    interrupts_restore(flags);
+    if (!reset) {
+        console_writeln("\n[COMPARACION] Error al preparar la pasada Clock.");
+        process_exit_with_status(-1);
+    }
+    if (!comparison_pass(&clock)) valid = false;
+    if (fifo.resident_pages > frames || clock.resident_pages > frames) valid = false;
+    flags = interrupts_save();
+    console_write("\n[COMPARACION] PID "); console_uint(process_current_pid());
+    console_write(": paginas=5 marcos="); console_uint(frames);
+    console_write(" referencias="); console_uint(sizeof(comparison_trace)); console_putc('\n');
+    console_write("Secuencia:");
+    for (size_t i = 0u; i < sizeof(comparison_trace); ++i) {
+        console_putc(' '); console_uint(comparison_trace[i]);
+    }
+    console_putc('\n');
+    comparison_row("FIFO:", &fifo, false);
+    comparison_row("Clock:", &clock, true);
+    console_writeln("Metricas solo de la secuencia; verificacion final excluida. Respaldo en RAM.");
+    console_writeln(valid ? "[COMPARACION] Datos verificados en ambas politicas. Proceso finalizado."
+                          : "[COMPARACION] ERROR al verificar los datos.");
+    interrupts_restore(flags);
+    if (!valid) process_exit_with_status(-1);
+}
+
+static void cmd_vmcompare(size_t argc, char **argv)
+{
+    uint32_t frames = 3u;
+    if (argc > 2u) { console_writeln("Uso: vmcompare [marcos] (1..5; por defecto: 3)"); return; }
+    if (argc == 2u && (!parse_pid(argv[1], &frames) || frames == 0u || frames > COMPARE_PAGES)) {
+        console_writeln("Error: usa entre 1 y 5 marcos."); return;
+    }
+    uint32_t flags = interrupts_save();
+    uint32_t pid = process_spawn("comparacion", comparison_worker);
+    process_info_t process;
+    if (pid == 0u || !process_find_info(pid, &process) ||
+        !memory_space_reserve_fifo(process.address_space, REPLACEMENT_DEMO_BASE, COMPARE_PAGES, frames, true)) {
+        if (pid != 0u) (void)process_kill(pid);
+        console_writeln("Error: sin recursos para iniciar la comparacion.");
+    } else {
+        console_write("Comparacion iniciada. PID: "); console_uint(pid);
+        console_writeln(". Mostrara resultados y terminara automaticamente; kill PID permite cancelarla.");
     }
     interrupts_restore(flags);
 }
