@@ -7,6 +7,7 @@
 #define FRAME_MAX (MEMORY_DIRECT_MAP_LIMIT / MEMORY_PAGE_SIZE)
 #define PRESENT 1u
 #define WRITABLE 2u
+#define ACCESSED (1u << 5)
 #define ADDRESS 0xFFFFF000u
 /* La clase impide liberar por error una tabla como si fuera un marco suelto. */
 enum { FRAME_FREE, FRAME_RESERVED, FRAME_RAW, FRAME_DIRECTORY, FRAME_TABLE, FRAME_PAGE };
@@ -22,29 +23,32 @@ typedef struct {
     uintptr_t base;
     uint32_t pages, resident, faults;
     bool writable;
-    uint32_t resident_limit, evictions, restores; /* Limite cero: demanda sin FIFO. */
-    size_t fifo_head, fifo_tail;
+    uint32_t resident_limit, evictions, restores; /* Limite cero: sin reemplazo. */
+    bool clock;
+    uint32_t scans, second_chances;
+    size_t queue_head, queue_tail;
 } demand_region_t;
 static demand_region_t regions[MEMORY_MAX_REGIONS];
 static uint32_t demand_faults;
 
-#define NO_FIFO_PAGE MEMORY_BACKING_PAGES
+#define NO_BACKED_PAGE MEMORY_BACKING_PAGES
 typedef struct {
     demand_region_t *owner;
     uintptr_t address, frame;
     size_t next;
     bool stored;
-} fifo_page_t;
-static fifo_page_t fifo_pages[MEMORY_BACKING_PAGES];
+} backed_page_t;
+static backed_page_t backed_pages[MEMORY_BACKING_PAGES];
 /* Respaldo educativo preasignado en BSS. Cada slot pertenece a una unica
    pagina virtual; nunca se mezcla con los marcos residentes del allocator. */
 static _Alignas(4096) unsigned char backing[MEMORY_BACKING_PAGES][MEMORY_PAGE_SIZE];
 static uint32_t fifo_evictions, fifo_restores;
+static uint32_t clock_evictions, clock_restores, clock_scans, clock_second_chances;
 
 static void release_backing(demand_region_t *region)
 {
     for (size_t i = 0u; i < MEMORY_BACKING_PAGES; ++i) {
-        if (fifo_pages[i].owner == region) memset(&fifo_pages[i], 0, sizeof(fifo_pages[i]));
+        if (backed_pages[i].owner == region) memset(&backed_pages[i], 0, sizeof(backed_pages[i]));
     }
 }
 
@@ -269,7 +273,7 @@ static bool page_present(memory_space_t space, uintptr_t address)
 }
 
 static bool reserve_region(memory_space_t space, uintptr_t base, uint32_t pages,
-                            uint32_t resident_limit, bool writable)
+                            uint32_t resident_limit, bool writable, bool clock)
 {
     uint32_t flags = interrupts_save();
     uint64_t end = (uint64_t)base + (uint64_t)pages * MEMORY_PAGE_SIZE;
@@ -290,7 +294,7 @@ static bool reserve_region(memory_space_t space, uintptr_t base, uint32_t pages,
     if (resident_limit != 0u) {
         size_t free_slots = 0u;
         for (size_t i = 0u; i < MEMORY_BACKING_PAGES; ++i)
-            if (fifo_pages[i].owner == NULL) ++free_slots;
+            if (backed_pages[i].owner == NULL) ++free_slots;
         if (pages > free_slots || resident_limit > pages) {
             interrupts_restore(flags); return false;
         }
@@ -301,14 +305,14 @@ static bool reserve_region(memory_space_t space, uintptr_t base, uint32_t pages,
         }
     }
     *available = (demand_region_t){.space = space, .base = base, .pages = pages,
-        .writable = writable, .resident_limit = resident_limit,
-        .fifo_head = NO_FIFO_PAGE, .fifo_tail = NO_FIFO_PAGE};
+        .writable = writable, .resident_limit = resident_limit, .clock = clock,
+        .queue_head = NO_BACKED_PAGE, .queue_tail = NO_BACKED_PAGE};
     if (resident_limit != 0u) {
         uint32_t assigned = 0u;
         for (size_t i = 0u; i < MEMORY_BACKING_PAGES && assigned < pages; ++i) {
-            if (fifo_pages[i].owner != NULL) continue;
-            fifo_pages[i] = (fifo_page_t){.owner = available,
-                .address = base + assigned * MEMORY_PAGE_SIZE, .next = NO_FIFO_PAGE};
+            if (backed_pages[i].owner != NULL) continue;
+            backed_pages[i] = (backed_page_t){.owner = available,
+                .address = base + assigned * MEMORY_PAGE_SIZE, .next = NO_BACKED_PAGE};
             ++assigned;
         }
     }
@@ -318,13 +322,19 @@ static bool reserve_region(memory_space_t space, uintptr_t base, uint32_t pages,
 
 bool memory_space_reserve(memory_space_t space, uintptr_t base, uint32_t pages, bool writable)
 {
-    return reserve_region(space, base, pages, 0u, writable);
+    return reserve_region(space, base, pages, 0u, writable, false);
 }
 bool memory_space_reserve_fifo(memory_space_t space, uintptr_t base, uint32_t pages,
                                 uint32_t resident_limit, bool writable)
 {
     if (resident_limit == 0u || resident_limit > pages || pages > MEMORY_BACKING_PAGES) return false;
-    return reserve_region(space, base, pages, resident_limit, writable);
+    return reserve_region(space, base, pages, resident_limit, writable, false);
+}
+bool memory_space_reserve_clock(memory_space_t space, uintptr_t base, uint32_t pages,
+                                uint32_t resident_limit, bool writable)
+{
+    if (resident_limit == 0u || resident_limit > pages || pages > MEMORY_BACKING_PAGES) return false;
+    return reserve_region(space, base, pages, resident_limit, writable, true);
 }
 
 bool memory_space_unreserve(memory_space_t space, uintptr_t base)
@@ -338,7 +348,7 @@ bool memory_space_unreserve(memory_space_t space, uintptr_t base)
         uintptr_t address = base + i * MEMORY_PAGE_SIZE;
         if (page_present(space, address)) (void)unmap_page(space, address, NULL);
     }
-    /* FIFO conserva las tablas vacias para recargar sin otra asignacion.
+    /* El reemplazo conserva las tablas vacias para recargar sin otra asignacion.
        Al liberar la region tambien hay que devolver esas tablas. */
     uint32_t last_directory = (base + (region->pages - 1u) * MEMORY_PAGE_SIZE) >> 22;
     for (uint32_t d = base >> 22; d <= last_directory; ++d) prune_table(space, d);
@@ -359,33 +369,77 @@ bool memory_space_demand_info(memory_space_t space, memory_demand_info_t *info)
         info->reserved_pages += regions[i].pages;
         info->resident_pages += regions[i].resident;
         info->handled_faults += regions[i].faults;
-        if (regions[i].resident_limit != 0u) {
+        if (regions[i].resident_limit != 0u && !regions[i].clock) {
             ++info->fifo_regions;
             info->fifo_limit += regions[i].resident_limit;
             info->fifo_resident += regions[i].resident;
-            info->evictions += regions[i].evictions;
-            info->restores += regions[i].restores;
+        }
+        info->evictions += regions[i].evictions;
+        info->restores += regions[i].restores;
+        if (regions[i].clock) {
+            ++info->clock_regions;
+            info->clock_limit += regions[i].resident_limit;
+            info->clock_resident += regions[i].resident;
+            info->clock_evictions += regions[i].evictions;
+            info->clock_restores += regions[i].restores;
+            info->clock_scans += regions[i].scans;
+            info->clock_second_chances += regions[i].second_chances;
         }
     }
     for (size_t i = 0u; i < MEMORY_BACKING_PAGES; ++i) {
-        const fifo_page_t *page = &fifo_pages[i];
+        const backed_page_t *page = &backed_pages[i];
         if (page->owner == NULL || page->owner->space != space) continue;
         ++info->backing_used;
         if (page->stored && page->frame == 0u) ++info->swapped_pages;
+        if (page->owner->clock) {
+            ++info->clock_backing_used;
+            if (page->stored && page->frame == 0u) ++info->clock_swapped_pages;
+        }
     }
     interrupts_restore(flags);
     return true;
 }
 
-/* Carga una pagina FIFO sin tocar paginas ni pilas ajenas a su region.
-   La preparacion que puede fallar se completa antes de desalojar la victima. */
-static bool fifo_load(demand_region_t *region, uintptr_t address)
+/* La cabeza representa la manecilla. Rotar una pagina con A=1 al final de
+   la cola equivale a avanzar en un anillo de marcos. Las IRQ estan apagadas:
+   nadie accede a estas paginas durante el barrido, de modo que termina en
+   como maximo resident+1 inspecciones (tambien con una sola pagina).
+   Intel SDM 3A, 4.8 y 4.10.4.3: limpiar A exige invalidar la traduccion para
+   que un acceso posterior vuelva a actualizar el bit en memoria. */
+static size_t select_victim(demand_region_t *region)
 {
-    size_t target = NO_FIFO_PAGE;
-    for (size_t i = 0u; i < MEMORY_BACKING_PAGES; ++i) {
-        if (fifo_pages[i].owner == region && fifo_pages[i].address == address) { target = i; break; }
+    while (region->clock && region->queue_head != NO_BACKED_PAGE) {
+        size_t index = region->queue_head;
+        backed_page_t *page = &backed_pages[index];
+        uint32_t *directory = (void *)region->space;
+        uint32_t *table = (void *)(uintptr_t)(directory[page->address >> 22] & ADDRESS);
+        volatile uint32_t *entry = &table[(page->address >> 12) & 1023u];
+        ++region->scans;
+        ++clock_scans;
+        if ((*entry & ACCESSED) == 0u) break;
+        *entry &= ~ACCESSED;
+        invalidate(region->space, page->address);
+        ++region->second_chances;
+        ++clock_second_chances;
+        if (page->next != NO_BACKED_PAGE) {
+            region->queue_head = page->next;
+            backed_pages[region->queue_tail].next = index;
+            region->queue_tail = index;
+            page->next = NO_BACKED_PAGE;
+        }
     }
-    if (target == NO_FIFO_PAGE || fifo_pages[target].frame != 0u) return false;
+    return region->queue_head;
+}
+
+/* Carga una pagina con respaldo sin tocar paginas ni pilas ajenas a su region.
+   La preparacion que puede fallar se completa antes de desalojar la victima. */
+static bool replacement_load(demand_region_t *region, uintptr_t address)
+{
+    size_t target = NO_BACKED_PAGE;
+    for (size_t i = 0u; i < MEMORY_BACKING_PAGES; ++i) {
+        if (backed_pages[i].owner == region && backed_pages[i].address == address) { target = i; break; }
+    }
+    if (target == NO_BACKED_PAGE || backed_pages[target].frame != 0u) return false;
     uint32_t *directory = (void *)region->space;
     uint32_t d = address >> 22, p = (address >> 12) & 1023u;
     bool new_table = (directory[d] & PRESENT) == 0u;
@@ -393,12 +447,12 @@ static bool fifo_load(demand_region_t *region, uintptr_t address)
     if (table_address == 0u) return false;
     uintptr_t physical = region->resident < region->resident_limit ? allocate(FRAME_PAGE) : 0u;
     if (physical == 0u) {
-        size_t victim_index = region->fifo_head;
-        if (victim_index == NO_FIFO_PAGE) {
+        size_t victim_index = select_victim(region);
+        if (victim_index == NO_BACKED_PAGE) {
             if (new_table) (void)release(table_address, FRAME_TABLE);
             return false;
         }
-        fifo_page_t *victim = &fifo_pages[victim_index];
+        backed_page_t *victim = &backed_pages[victim_index];
         physical = victim->frame;
         memcpy(backing[victim_index], (const void *)physical, MEMORY_PAGE_SIZE);
         victim->stored = true;
@@ -406,18 +460,20 @@ static bool fifo_load(demand_region_t *region, uintptr_t address)
         old_table[(victim->address >> 12) & 1023u] = 0u;
         invalidate(region->space, victim->address);
         victim->frame = 0u;
-        region->fifo_head = victim->next;
-        if (region->fifo_head == NO_FIFO_PAGE) region->fifo_tail = NO_FIFO_PAGE;
-        victim->next = NO_FIFO_PAGE;
+        region->queue_head = victim->next;
+        if (region->queue_head == NO_BACKED_PAGE) region->queue_tail = NO_BACKED_PAGE;
+        victim->next = NO_BACKED_PAGE;
         --region->resident;
         ++region->evictions;
-        ++fifo_evictions;
+        if (region->clock) ++clock_evictions;
+        else ++fifo_evictions;
     }
-    fifo_page_t *page = &fifo_pages[target];
+    backed_page_t *page = &backed_pages[target];
     if (page->stored) {
         memcpy((void *)physical, backing[target], MEMORY_PAGE_SIZE);
         ++region->restores;
-        ++fifo_restores;
+        if (region->clock) ++clock_restores;
+        else ++fifo_restores;
     } else {
         memset((void *)physical, 0, MEMORY_PAGE_SIZE);
     }
@@ -426,10 +482,10 @@ static bool fifo_load(demand_region_t *region, uintptr_t address)
     table[p] = physical | PRESENT | (region->writable ? WRITABLE : 0u);
     invalidate(region->space, address);
     page->frame = physical;
-    page->next = NO_FIFO_PAGE;
-    if (region->fifo_tail == NO_FIFO_PAGE) region->fifo_head = target;
-    else fifo_pages[region->fifo_tail].next = target;
-    region->fifo_tail = target;
+    page->next = NO_BACKED_PAGE;
+    if (region->queue_tail == NO_BACKED_PAGE) region->queue_head = target;
+    else backed_pages[region->queue_tail].next = target;
+    region->queue_tail = target;
     return true; /* El llamador actualiza residentes y fallos. */
 }
 
@@ -445,7 +501,7 @@ memory_fault_result_t memory_handle_page_fault(uintptr_t address, uint32_t error
         interrupts_restore(flags); return MEMORY_FAULT_INVALID;
     }
     uintptr_t physical;
-    bool loaded = region->resident_limit != 0u ? fifo_load(region, address & ADDRESS) :
+    bool loaded = region->resident_limit != 0u ? replacement_load(region, address & ADDRESS) :
         map_page(active_space, address & ADDRESS, region->writable, &physical);
     if (!loaded) {
         interrupts_restore(flags); return MEMORY_FAULT_NO_MEMORY;
@@ -511,15 +567,17 @@ void memory_get_stats(memory_stats_t *stats)
         .free_frames = total_frames - used_frames, .reserved_frames = reserved_frames,
         .paging_enabled = initialized && (cr0 & 0x80000000u) != 0u,
         .uses_memory_map = uses_memory_map, .demand_faults = demand_faults,
-        .fifo_evictions = fifo_evictions, .fifo_restores = fifo_restores};
+        .fifo_evictions = fifo_evictions, .fifo_restores = fifo_restores,
+        .clock_evictions = clock_evictions, .clock_restores = clock_restores,
+        .clock_scans = clock_scans, .clock_second_chances = clock_second_chances};
     for (size_t i = 0u; i < MEMORY_MAX_REGIONS; ++i) {
         stats->demand_reserved_pages += regions[i].pages;
         stats->demand_resident_pages += regions[i].resident;
     }
     for (size_t i = 0u; i < MEMORY_BACKING_PAGES; ++i) {
-        if (fifo_pages[i].owner == NULL) continue;
+        if (backed_pages[i].owner == NULL) continue;
         ++stats->backing_used;
-        if (fifo_pages[i].stored && fifo_pages[i].frame == 0u) ++stats->swapped_pages;
+        if (backed_pages[i].stored && backed_pages[i].frame == 0u) ++stats->swapped_pages;
     }
     interrupts_restore(flags);
 }

@@ -18,11 +18,15 @@ typedef struct {
     bool paging_enabled, uses_memory_map;
     uint32_t demand_reserved_pages, demand_resident_pages, demand_faults;
     uint32_t backing_used, swapped_pages, fifo_evictions, fifo_restores;
+    uint32_t clock_evictions, clock_restores, clock_scans, clock_second_chances;
 } memory_stats_t;
 typedef struct {
     uint32_t regions, reserved_pages, resident_pages, handled_faults;
     uint32_t fifo_regions, fifo_limit, fifo_resident, backing_used, swapped_pages;
-    uint32_t evictions, restores;
+    uint32_t evictions, restores; /* Totales de FIFO y Clock. */
+    uint32_t clock_regions, clock_limit, clock_resident;
+    uint32_t clock_backing_used, clock_swapped_pages;
+    uint32_t clock_evictions, clock_restores, clock_scans, clock_second_chances;
 } memory_demand_info_t;
 typedef enum {
     MEMORY_FAULT_INVALID, MEMORY_FAULT_RESOLVED, MEMORY_FAULT_NO_MEMORY
@@ -49,6 +53,12 @@ bool memory_space_reserve(memory_space_t space, uintptr_t base, uint32_t pages, 
    Esta area de respaldo pertenece al kernel: no aumenta la RAM disponible.
    Los accesos a paginas ya presentes no cambian el orden FIFO. */
 bool memory_space_reserve_fifo(memory_space_t space, uintptr_t base, uint32_t pages,
+                                uint32_t resident_limit, bool writable);
+/* Misma reserva y respaldo compartido, con Clock/segunda oportunidad.
+   Usa el bit Accessed de la PTE: lo limpia y hace INVLPG antes de avanzar
+   la manecilla. Una pagina accedida de nuevo recibe otra oportunidad.
+   Equivale a una cola circular; no es LRU exacto. */
+bool memory_space_reserve_clock(memory_space_t space, uintptr_t base, uint32_t pages,
                                 uint32_t resident_limit, bool writable);
 /* Libera la region completa y todas sus paginas residentes. Las funciones
    alloc/free de una pagina no pueden modificar una region reservada. */
