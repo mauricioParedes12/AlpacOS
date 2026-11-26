@@ -28,6 +28,7 @@ static void cmd_ioinfo(size_t argc, char **argv);
 static void cmd_faultdemo(size_t argc, char **argv);
 static void cmd_demanddemo(size_t argc, char **argv);
 static void cmd_vmstat(size_t argc, char **argv);
+static void cmd_fifodemo(size_t argc, char **argv);
 static void cmd_help(size_t argc, char **argv);
 static void cmd_clear(size_t argc, char **argv);
 static void cmd_echo(size_t argc, char **argv);
@@ -61,6 +62,7 @@ static const command_t commands[] = {
     {"faultdemo", "Crea un proceso que provoca un fallo de pagina", cmd_faultdemo},
     {"demanddemo", "Reserva cuatro paginas y las usa de una en una", cmd_demanddemo},
     {"vmstat", "Paginas reservadas, residentes y fallos atendidos: vmstat PID", cmd_vmstat},
+    {"fifodemo", "Reemplazo con respaldo RAM: fifodemo [paginas marcos]", cmd_fifodemo},
     {"help", "Lista los comandos disponibles", cmd_help},
     {"clear", "Limpia la consola", cmd_clear},
     {"echo", "Muestra los argumentos separados por espacios", cmd_echo},
@@ -174,6 +176,12 @@ static void cmd_meminfo(size_t argc, char **argv)
     console_write(" residentes="); console_uint(stats.demand_resident_pages);
     console_write(" fallos_atendidos="); console_uint(stats.demand_faults);
     console_writeln(" (fallos acumulados desde el arranque)");
+    console_write("FIFO: respaldo_RAM="); console_uint(stats.backing_used);
+    console_putc('/'); console_uint(MEMORY_BACKING_PAGES);
+    console_write(" paginas, fuera="); console_uint(stats.swapped_pages);
+    console_write(" reemplazos="); console_uint(stats.fifo_evictions);
+    console_write(" recuperaciones="); console_uint(stats.fifo_restores);
+    console_writeln(" (acumulados; sin swap en disco)");
     console_write("Kernel: ");
     console_hex((uint32_t)info->kernel_start);
     console_write(" - ");
@@ -281,7 +289,7 @@ static void cmd_modules(size_t argc, char **argv)
     console_writeln("[OK] Hilos del kernel y Round Robin por TID");
     console_writeln("[OK] Mutex, semaforos, sleep e idle; limpieza al finalizar");
     console_writeln("[OK] Allocator de marcos de 4 KiB y paginacion x86 activa");
-    console_writeln("[OK] Reservas virtuales y paginas anonimas bajo demanda; sin reemplazo ni swap");
+    console_writeln("[OK] Demanda y FIFO por region con respaldo RAM; sin swap en disco");
     console_writeln("[OK] CR3 por proceso y pagina privada en 0x40000000");
     console_writeln("[OK] VFS con nodos, operaciones y montajes; backend RAMFS sin persistencia");
     console_writeln("[OK] Deteccion de ciclos y recuperacion de deadlocks con mutex");
@@ -845,6 +853,85 @@ static void cmd_vmstat(size_t argc, char **argv)
         console_write(" residentes="); console_uint(info.resident_pages);
         console_write(" fallos_atendidos="); console_uint(info.handled_faults);
         console_writeln(" (regiones vigentes)");
+        console_write("FIFO: regiones="); console_uint(info.fifo_regions);
+        console_write(" limite="); console_uint(info.fifo_limit);
+        console_write(" residentes="); console_uint(info.fifo_resident);
+        console_write(" fuera="); console_uint(info.swapped_pages);
+        console_write(" reemplazos="); console_uint(info.evictions);
+        console_write(" recuperaciones="); console_uint(info.restores);
+        console_write(" respaldo_RAM="); console_uint(info.backing_used);
+        console_putc('\n');
+    }
+    interrupts_restore(flags);
+}
+
+#define FIFO_DEMO_BASE 0x60000000u
+
+static uint32_t fifo_pattern(uint32_t pid, uint32_t page, uint32_t word)
+{
+    return (pid * 0x01010101u) ^ (page << 16) ^ word;
+}
+
+static void fifo_worker(void)
+{
+    memory_space_t space = memory_space_current();
+    memory_demand_info_t info;
+    if (!memory_space_demand_info(space, &info) || info.fifo_regions != 1u) return;
+    uint32_t pages = info.reserved_pages, pid = process_current_pid();
+    bool valid = true;
+    for (uint32_t i = 0u; i < pages; ++i) {
+        thread_sleep(25u);
+        volatile uint32_t *page = (volatile uint32_t *)(FIFO_DEMO_BASE + i * MEMORY_PAGE_SIZE);
+        for (uint32_t j = 0u; j < MEMORY_PAGE_SIZE / sizeof(uint32_t); ++j) {
+            if (page[j] != 0u) valid = false;
+            page[j] = fifo_pattern(pid, i, j);
+        }
+    }
+    /* Una segunda pasada obliga a recuperar las paginas que salieron. */
+    for (uint32_t i = 0u; i < pages; ++i) {
+        thread_sleep(25u);
+        volatile uint32_t *page = (volatile uint32_t *)(FIFO_DEMO_BASE + i * MEMORY_PAGE_SIZE);
+        for (uint32_t j = 0u; j < MEMORY_PAGE_SIZE / sizeof(uint32_t); ++j)
+            if (page[j] != fifo_pattern(pid, i, j)) valid = false;
+    }
+    if (!memory_space_demand_info(space, &info) || info.fifo_resident > info.fifo_limit) valid = false;
+    uint32_t flags = interrupts_save();
+    console_write("\n[FIFO] PID "); console_uint(pid);
+    console_write(valid ? ": datos verificados. Paginas=" : ": ERROR de datos. Paginas=");
+    console_uint(pages); console_write(" marcos="); console_uint(info.fifo_resident);
+    console_write(" fallos="); console_uint(info.handled_faults);
+    console_write(" reemplazos="); console_uint(info.evictions);
+    console_write(" recuperaciones="); console_uint(info.restores);
+    console_writeln(". Usa vmstat y kill.");
+    interrupts_restore(flags);
+    if (!valid) return;
+    for (;;) thread_sleep(100u);
+}
+
+static void cmd_fifodemo(size_t argc, char **argv)
+{
+    uint32_t pages = 6u, frames = 3u;
+    if (argc != 1u && argc != 3u) {
+        console_writeln("Uso: fifodemo [paginas marcos] (por defecto: 6 3)"); return;
+    }
+    if (argc == 3u && (!parse_pid(argv[1], &pages) || !parse_pid(argv[2], &frames))) {
+        console_writeln("Error: paginas y marcos deben ser enteros positivos."); return;
+    }
+    if (pages == 0u || pages > MEMORY_BACKING_PAGES || frames == 0u || frames > pages) {
+        console_writeln("Error: usa 1 <= marcos <= paginas <= 64."); return;
+    }
+    uint32_t flags = interrupts_save();
+    uint32_t pid = process_spawn("fifo", fifo_worker);
+    process_info_t process;
+    if (pid == 0u || !process_find_info(pid, &process) ||
+        !memory_space_reserve_fifo(process.address_space, FIFO_DEMO_BASE, pages, frames, true)) {
+        if (pid != 0u) (void)process_kill(pid);
+        console_writeln("Error: sin recursos para el proceso, la region o su respaldo RAM.");
+    } else {
+        console_write("FIFO iniciado. PID: "); console_uint(pid);
+        console_write(". Paginas="); console_uint(pages);
+        console_write(" limite_residente="); console_uint(frames);
+        console_writeln(" residentes=0. Respaldo en RAM, no en disco.");
     }
     interrupts_restore(flags);
 }
