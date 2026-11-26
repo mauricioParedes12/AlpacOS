@@ -1,6 +1,7 @@
 #include <alpacos/console.h>
 #include <alpacos/interrupts.h>
 #include <alpacos/io.h>
+#include <alpacos/memory.h>
 #include <alpacos/process.h>
 #include <stddef.h>
 
@@ -129,6 +130,15 @@ static _Noreturn void exception_panic(const interrupt_frame_t *frame)
 interrupt_frame_t *interrupts_dispatch(interrupt_frame_t *frame)
 {
     if (frame->vector == 0x80u) return process_schedule(frame, false);
+    if (frame->vector == 14u && process_current_pid() != 0u) {
+        uint32_t address;
+        __asm__ volatile ("movl %%cr2, %0" : "=r"(address));
+        memory_fault_result_t result = memory_handle_page_fault(address, frame->error);
+        /* IRET reintenta la misma instruccion; no se modifica EIP. */
+        if (result == MEMORY_FAULT_RESOLVED) return frame;
+        if (result == MEMORY_FAULT_NO_MEMORY)
+            console_writeln("\n[DEMANDA] Sin marcos libres para atender el fallo.");
+    }
     if (frame->vector < IRQ_BASE || frame->vector >= IRQ_BASE + 16u) {
         exception_panic(frame);
     }

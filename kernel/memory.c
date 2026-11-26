@@ -17,6 +17,25 @@ static memory_space_t active_space;
 static uint32_t total_frames, used_frames, reserved_frames;
 static bool initialized, uses_memory_map;
 
+typedef struct {
+    memory_space_t space; /* Cero identifica una entrada libre. */
+    uintptr_t base;
+    uint32_t pages, resident, faults;
+    bool writable;
+} demand_region_t;
+static demand_region_t regions[MEMORY_MAX_REGIONS];
+static uint32_t demand_faults;
+
+static demand_region_t *region_at(memory_space_t space, uintptr_t address)
+{
+    for (size_t i = 0u; i < MEMORY_MAX_REGIONS; ++i) {
+        demand_region_t *region = &regions[i];
+        if (region->space == space && region->space != 0u && address >= region->base &&
+            (address - region->base) / MEMORY_PAGE_SIZE < region->pages) return region;
+    }
+    return NULL;
+}
+
 static uintptr_t allocate(uint8_t kind)
 {
     for (uint32_t f = 0; f < total_frames; ++f) {
@@ -153,43 +172,37 @@ void memory_space_activate(memory_space_t space)
         __asm__ volatile ("movl %0, %%cr3" : : "r"(space) : "memory");
     }
 }
-bool memory_space_alloc(memory_space_t space, uintptr_t address, uintptr_t *physical_out)
+/* Helpers internos: espacio/direccion validados y las IRQ desactivadas. */
+static bool map_page(memory_space_t space, uintptr_t address, bool writable, uintptr_t *physical_out)
 {
-    uint32_t flags = interrupts_save();
-    if (!valid_space(space) || !private_address(address) || physical_out == NULL) {
-        interrupts_restore(flags); return false;
-    }
     uint32_t *directory = (void *)space;
     uint32_t d = address >> 22, p = (address >> 12) & 1023u;
     bool new_table = (directory[d] & PRESENT) == 0u;
     uintptr_t table_address = directory[d] & ADDRESS;
     if (new_table) table_address = allocate(FRAME_TABLE);
-    if (table_address == 0u) { interrupts_restore(flags); return false; }
+    if (table_address == 0u) return false;
     uint32_t *table = (void *)table_address;
-    if ((table[p] & PRESENT) != 0u) { interrupts_restore(flags); return false; }
+    if ((table[p] & PRESENT) != 0u) return false;
     uintptr_t physical = allocate(FRAME_PAGE);
     if (physical == 0u) {
         if (new_table) (void)release(table_address, FRAME_TABLE);
-        interrupts_restore(flags); return false;
+        return false;
     }
     directory[d] = table_address | PRESENT | WRITABLE;
-    table[p] = physical | PRESENT | WRITABLE;
+    table[p] = physical | PRESENT | (writable ? WRITABLE : 0u);
     invalidate(space, address);
     *physical_out = physical;
-    interrupts_restore(flags);
     return true;
 }
-bool memory_space_free(memory_space_t space, uintptr_t address, uintptr_t *physical_out)
+static bool unmap_page(memory_space_t space, uintptr_t address, uintptr_t *physical_out)
 {
-    uint32_t flags = interrupts_save();
-    if (!valid_space(space) || !private_address(address)) { interrupts_restore(flags); return false; }
     uint32_t *directory = (void *)space;
     uint32_t d = address >> 22, p = (address >> 12) & 1023u;
-    if ((directory[d] & PRESENT) == 0u) { interrupts_restore(flags); return false; }
+    if ((directory[d] & PRESENT) == 0u) return false;
     uint32_t *table = (void *)(uintptr_t)(directory[d] & ADDRESS);
     uintptr_t physical = table[p] & ADDRESS;
     if ((table[p] & PRESENT) == 0u || !release(physical, FRAME_PAGE)) {
-        interrupts_restore(flags); return false;
+        return false;
     }
     table[p] = 0u;
     invalidate(space, address);
@@ -201,8 +214,114 @@ bool memory_space_free(memory_space_t space, uintptr_t address, uintptr_t *physi
         (void)release(frame, FRAME_TABLE);
     }
     if (physical_out != NULL) *physical_out = physical;
+    return true;
+}
+bool memory_space_alloc(memory_space_t space, uintptr_t address, uintptr_t *physical_out)
+{
+    uint32_t flags = interrupts_save();
+    bool result = valid_space(space) && private_address(address) && physical_out != NULL &&
+        region_at(space, address) == NULL && map_page(space, address, true, physical_out);
+    interrupts_restore(flags);
+    return result;
+}
+bool memory_space_free(memory_space_t space, uintptr_t address, uintptr_t *physical_out)
+{
+    uint32_t flags = interrupts_save();
+    bool result = valid_space(space) && private_address(address) &&
+        region_at(space, address) == NULL && unmap_page(space, address, physical_out);
+    interrupts_restore(flags);
+    return result;
+}
+
+static bool page_present(memory_space_t space, uintptr_t address)
+{
+    const uint32_t *directory = (const void *)space;
+    uint32_t entry = directory[address >> 22];
+    if ((entry & PRESENT) == 0u) return false;
+    const uint32_t *table = (const void *)(uintptr_t)(entry & ADDRESS);
+    return (table[(address >> 12) & 1023u] & PRESENT) != 0u;
+}
+
+bool memory_space_reserve(memory_space_t space, uintptr_t base, uint32_t pages, bool writable)
+{
+    uint32_t flags = interrupts_save();
+    uint64_t end = (uint64_t)base + (uint64_t)pages * MEMORY_PAGE_SIZE;
+    if (!valid_space(space) || space == memory_space_kernel() || !private_address(base) ||
+        pages == 0u || pages > MEMORY_REGION_MAX_PAGES || end > 0x100000000ull) {
+        interrupts_restore(flags); return false;
+    }
+    demand_region_t *available = NULL;
+    for (size_t i = 0u; i < MEMORY_MAX_REGIONS; ++i) {
+        demand_region_t *region = &regions[i];
+        if (region->space == 0u) { if (available == NULL) available = region; continue; }
+        uint64_t other_end = (uint64_t)region->base + (uint64_t)region->pages * MEMORY_PAGE_SIZE;
+        if (region->space == space && (uint64_t)base < other_end && (uint64_t)region->base < end) {
+            interrupts_restore(flags); return false;
+        }
+    }
+    if (available == NULL) { interrupts_restore(flags); return false; }
+    for (uint32_t i = 0u; i < pages; ++i) {
+        if (page_present(space, base + i * MEMORY_PAGE_SIZE)) {
+            interrupts_restore(flags); return false;
+        }
+    }
+    *available = (demand_region_t){.space = space, .base = base, .pages = pages, .writable = writable};
     interrupts_restore(flags);
     return true;
+}
+
+bool memory_space_unreserve(memory_space_t space, uintptr_t base)
+{
+    uint32_t flags = interrupts_save();
+    demand_region_t *region = region_at(space, base);
+    if (!valid_space(space) || region == NULL || region->base != base) {
+        interrupts_restore(flags); return false;
+    }
+    for (uint32_t i = 0u; i < region->pages; ++i) {
+        uintptr_t address = base + i * MEMORY_PAGE_SIZE;
+        if (page_present(space, address)) (void)unmap_page(space, address, NULL);
+    }
+    memset(region, 0, sizeof(*region));
+    interrupts_restore(flags);
+    return true;
+}
+
+bool memory_space_demand_info(memory_space_t space, memory_demand_info_t *info)
+{
+    uint32_t flags = interrupts_save();
+    if (!valid_space(space) || info == NULL) { interrupts_restore(flags); return false; }
+    memset(info, 0, sizeof(*info));
+    for (size_t i = 0u; i < MEMORY_MAX_REGIONS; ++i) {
+        if (regions[i].space != space) continue;
+        ++info->regions;
+        info->reserved_pages += regions[i].pages;
+        info->resident_pages += regions[i].resident;
+        info->handled_faults += regions[i].faults;
+    }
+    interrupts_restore(flags);
+    return true;
+}
+
+memory_fault_result_t memory_handle_page_fault(uintptr_t address, uint32_t error)
+{
+    uint32_t flags = interrupts_save();
+    demand_region_t *region = region_at(active_space, address);
+    /* Solo ausencia de pagina en ring 0: error 0 (lectura) o 2 (escritura).
+       P=1, U/S=1, RSVD y otros bits no son demanda anonima valida. */
+    if (!valid_space(active_space) || active_space == memory_space_kernel() ||
+        (error & ~2u) != 0u || region == NULL || ((error & 2u) != 0u && !region->writable) ||
+        page_present(active_space, address)) {
+        interrupts_restore(flags); return MEMORY_FAULT_INVALID;
+    }
+    uintptr_t physical;
+    if (!map_page(active_space, address & ADDRESS, region->writable, &physical)) {
+        interrupts_restore(flags); return MEMORY_FAULT_NO_MEMORY;
+    }
+    ++region->resident;
+    ++region->faults;
+    ++demand_faults;
+    interrupts_restore(flags);
+    return MEMORY_FAULT_RESOLVED;
 }
 bool memory_space_translate(memory_space_t space, uintptr_t address, uintptr_t *physical_out)
 {
@@ -236,6 +355,11 @@ bool memory_space_destroy(memory_space_t space)
         (void)release(directory[d] & ADDRESS, FRAME_TABLE);
     }
     bool result = release(space, FRAME_DIRECTORY);
+    if (result) {
+        for (size_t i = 0u; i < MEMORY_MAX_REGIONS; ++i) {
+            if (regions[i].space == space) memset(&regions[i], 0, sizeof(regions[i]));
+        }
+    }
     interrupts_restore(flags);
     return result;
 }
@@ -247,7 +371,13 @@ void memory_get_stats(memory_stats_t *stats)
     if (stats == NULL) return;
     uint32_t flags = interrupts_save(), cr0;
     __asm__ volatile ("movl %%cr0, %0" : "=r"(cr0));
-    *stats = (memory_stats_t){total_frames, used_frames, total_frames - used_frames,
-        reserved_frames, initialized && (cr0 & 0x80000000u) != 0u, uses_memory_map};
+    *stats = (memory_stats_t){.total_frames = total_frames, .used_frames = used_frames,
+        .free_frames = total_frames - used_frames, .reserved_frames = reserved_frames,
+        .paging_enabled = initialized && (cr0 & 0x80000000u) != 0u,
+        .uses_memory_map = uses_memory_map, .demand_faults = demand_faults};
+    for (size_t i = 0u; i < MEMORY_MAX_REGIONS; ++i) {
+        stats->demand_reserved_pages += regions[i].pages;
+        stats->demand_resident_pages += regions[i].resident;
+    }
     interrupts_restore(flags);
 }
