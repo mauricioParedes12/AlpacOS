@@ -26,6 +26,8 @@ typedef struct {
 static void cmd_procmap(size_t argc, char **argv);
 static void cmd_ioinfo(size_t argc, char **argv);
 static void cmd_faultdemo(size_t argc, char **argv);
+static void cmd_demanddemo(size_t argc, char **argv);
+static void cmd_vmstat(size_t argc, char **argv);
 static void cmd_help(size_t argc, char **argv);
 static void cmd_clear(size_t argc, char **argv);
 static void cmd_echo(size_t argc, char **argv);
@@ -57,6 +59,8 @@ static const command_t commands[] = {
     {"procmap", "Muestra CR3 y pagina privada: procmap PID", cmd_procmap},
     {"ioinfo", "Contadores de entrada PS/2 y COM1 por IRQ", cmd_ioinfo},
     {"faultdemo", "Crea un proceso que provoca un fallo de pagina", cmd_faultdemo},
+    {"demanddemo", "Reserva cuatro paginas y las usa de una en una", cmd_demanddemo},
+    {"vmstat", "Paginas reservadas, residentes y fallos atendidos: vmstat PID", cmd_vmstat},
     {"help", "Lista los comandos disponibles", cmd_help},
     {"clear", "Limpia la consola", cmd_clear},
     {"echo", "Muestra los argumentos separados por espacios", cmd_echo},
@@ -166,6 +170,10 @@ static void cmd_meminfo(size_t argc, char **argv)
     console_writeln(" marcos");
     console_write("Paginacion: ");
     console_writeln(stats.paging_enabled ? "ACTIVA (kernel compartido y directorio propio por proceso)" : "INACTIVA");
+    console_write("Demanda: reservadas="); console_uint(stats.demand_reserved_pages);
+    console_write(" residentes="); console_uint(stats.demand_resident_pages);
+    console_write(" fallos_atendidos="); console_uint(stats.demand_faults);
+    console_writeln(" (fallos acumulados desde el arranque)");
     console_write("Kernel: ");
     console_hex((uint32_t)info->kernel_start);
     console_write(" - ");
@@ -273,6 +281,7 @@ static void cmd_modules(size_t argc, char **argv)
     console_writeln("[OK] Hilos del kernel y Round Robin por TID");
     console_writeln("[OK] Mutex, semaforos, sleep e idle; limpieza al finalizar");
     console_writeln("[OK] Allocator de marcos de 4 KiB y paginacion x86 activa");
+    console_writeln("[OK] Reservas virtuales y paginas anonimas bajo demanda; sin reemplazo ni swap");
     console_writeln("[OK] CR3 por proceso y pagina privada en 0x40000000");
     console_writeln("[OK] VFS con nodos, operaciones y montajes; backend RAMFS sin persistencia");
     console_writeln("[OK] Deteccion de ciclos y recuperacion de deadlocks con mutex");
@@ -762,4 +771,80 @@ static void cmd_faultdemo(size_t argc, char **argv)
     if (!no_args(argc)) return;
     uint32_t pid = process_spawn("fallo-pagina", fault_worker);
     console_write("Proceso de prueba de fallo: PID "); console_uint(pid); console_putc('\n');
+}
+
+#define DEMAND_DEMO_BASE 0x50000000u
+#define DEMAND_DEMO_PAGES 4u
+
+static void demand_worker(void)
+{
+    uint32_t pid = process_current_pid();
+    bool valid = true;
+    for (uint32_t i = 0u; i < DEMAND_DEMO_PAGES; ++i) {
+        /* Deja tiempo para observar la diferencia entre reserva y residencia. */
+        thread_sleep(100u);
+        volatile uint32_t *page = (volatile uint32_t *)(DEMAND_DEMO_BASE + i * MEMORY_PAGE_SIZE);
+        for (size_t j = 0u; j < MEMORY_PAGE_SIZE / sizeof(uint32_t); ++j) {
+            if (page[j] != 0u) valid = false;
+        }
+        page[0] = pid ^ (i + 1u);
+        page[1023] = 0xABCD0000u + i;
+    }
+    for (uint32_t i = 0u; i < DEMAND_DEMO_PAGES; ++i) {
+        volatile uint32_t *page = (volatile uint32_t *)(DEMAND_DEMO_BASE + i * MEMORY_PAGE_SIZE);
+        if (page[0] != (pid ^ (i + 1u)) || page[1023] != 0xABCD0000u + i) valid = false;
+    }
+    memory_demand_info_t info;
+    if (!memory_space_demand_info(memory_space_current(), &info) ||
+        info.resident_pages != DEMAND_DEMO_PAGES || info.handled_faults != DEMAND_DEMO_PAGES)
+        valid = false;
+    uint32_t flags = interrupts_save();
+    console_write("\n[DEMANDA] PID "); console_uint(pid);
+    console_writeln(valid ? ": 4 paginas verificadas; el proceso sigue activo. Usa vmstat y kill."
+                          : ": ERROR al verificar las paginas.");
+    interrupts_restore(flags);
+    if (!valid) return;
+    for (;;) thread_sleep(100u);
+}
+
+static void cmd_demanddemo(size_t argc, char **argv)
+{
+    (void)argv;
+    if (!no_args(argc)) return;
+    /* El hilo no debe ejecutarse antes de completar su reserva virtual. */
+    uint32_t flags = interrupts_save();
+    uint32_t pid = process_spawn("demanda", demand_worker);
+    process_info_t process;
+    if (pid == 0u || !process_find_info(pid, &process) ||
+        !memory_space_reserve(process.address_space, DEMAND_DEMO_BASE, DEMAND_DEMO_PAGES, true)) {
+        if (pid != 0u) (void)process_kill(pid);
+        console_writeln("Error: no se pudo crear el proceso o reservar su region virtual.");
+    } else {
+        console_write("Demanda iniciada. PID: "); console_uint(pid);
+        console_writeln(". Base=0x50000000, reservadas=4, residentes=0.");
+        console_writeln("Accedera a una pagina por segundo. Consulta vmstat PID; termina con kill PID.");
+    }
+    interrupts_restore(flags);
+}
+
+static void cmd_vmstat(size_t argc, char **argv)
+{
+    if (!require_args(argc, 2u, "vmstat PID")) return;
+    uint32_t pid;
+    if (!parse_pid(argv[1], &pid)) { console_writeln("Error: PID invalido."); return; }
+    uint32_t flags = interrupts_save();
+    process_info_t process;
+    memory_demand_info_t info;
+    if (!process_find_info(pid, &process) || process.state == PROCESS_TERMINATED ||
+        !memory_space_demand_info(process.address_space, &info)) {
+        console_writeln("Error: proceso no activo.");
+    } else {
+        console_write("PID "); console_uint(pid);
+        console_write(" regiones="); console_uint(info.regions);
+        console_write(" reservadas="); console_uint(info.reserved_pages);
+        console_write(" residentes="); console_uint(info.resident_pages);
+        console_write(" fallos_atendidos="); console_uint(info.handled_faults);
+        console_writeln(" (regiones vigentes)");
+    }
+    interrupts_restore(flags);
 }
